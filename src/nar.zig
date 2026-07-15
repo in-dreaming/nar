@@ -5,6 +5,24 @@
 
 const foundation = @import("foundation");
 
+/// Stable foundation domain types used by all NAR subsystems.
+pub const domain = @import("foundation/domain.zig");
+pub const ErrorCode = domain.ErrorCode;
+pub const RuntimeId = domain.RuntimeId;
+pub const AgentId = domain.AgentId;
+pub const TurnId = domain.TurnId;
+pub const ToolId = domain.ToolId;
+pub const OperationId = domain.OperationId;
+pub const ObjectRef = domain.ObjectRef;
+pub const WorldRevision = domain.WorldRevision;
+pub const AgentEvent = domain.AgentEvent;
+pub const EventMailbox = domain.EventMailbox;
+pub const EventPriority = domain.EventPriority;
+pub const CancellationSource = domain.CancellationSource;
+pub const CancellationToken = domain.CancellationToken;
+pub const CancelReason = domain.CancelReason;
+pub const GenerationalRegistry = domain.GenerationalRegistry;
+
 /// Build-time configuration selected by the package consumer.
 /// Reading this value is thread-safe and has no ownership or lifetime concerns.
 pub const build_options = @import("nar_build_options");

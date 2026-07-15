@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     unit_tests.root_module.addImport("nar", nar);
+    unit_tests.root_module.addImport("foundation", foundation);
     const test_step = b.step("test", "Run bootstrap unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
