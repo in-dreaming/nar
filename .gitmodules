@@ -1,0 +1,8 @@
+[submodule "deps/fund"]
+	path = deps/fund
+	url = https://github.com/in-dreaming/fund.git
+	branch = main
+[submodule "deps/spindle"]
+	path = deps/spindle
+	url = https://github.com/in-dreaming/spindle.git
+	branch = main
