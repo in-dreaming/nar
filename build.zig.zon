@@ -1,0 +1,25 @@
+.{
+    .fingerprint = 0x7fe575ce906e225c,
+    .name = .nar,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .foundation = .{
+            .path = "deps/fund/foundation",
+        },
+        .spindle = .{
+            .path = "deps/spindle",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "LICENSE",
+        "README.md",
+        "adapters",
+        "src",
+        "tests",
+        "examples",
+    },
+}
