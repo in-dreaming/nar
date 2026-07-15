@@ -23,6 +23,9 @@ pub const CancellationToken = domain.CancellationToken;
 pub const CancelReason = domain.CancelReason;
 pub const GenerationalRegistry = domain.GenerationalRegistry;
 
+/// Streaming model backend contracts, router, and deterministic mock backend.
+pub const model = @import("model/model.zig");
+
 /// Build-time configuration selected by the package consumer.
 /// Reading this value is thread-safe and has no ownership or lifetime concerns.
 pub const build_options = @import("nar_build_options");

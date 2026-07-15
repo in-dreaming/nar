@@ -3,6 +3,7 @@ const nar = @import("nar");
 
 comptime {
     _ = @import("foundation_domain.zig");
+    _ = @import("model_stream.zig");
 }
 
 test "public build configuration is internally consistent" {
