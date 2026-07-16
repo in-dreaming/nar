@@ -36,6 +36,9 @@ pub const context = @import("context/runtime.zig");
 /// Append-only, checksummed turn trace encoding and bounded reader.
 pub const trace = @import("trace/runtime.zig");
 
+/// Bounded deterministic runtime, agent, and turn state machine.
+pub const core = @import("core/agent_loop.zig");
+
 /// Build-time configuration selected by the package consumer.
 /// Reading this value is thread-safe and has no ownership or lifetime concerns.
 pub const build_options = @import("nar_build_options");

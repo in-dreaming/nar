@@ -171,6 +171,17 @@ pub const Registry = struct {
         entry.release();
     }
 
+    /// Returns the current handle for a unique registered tool name. The
+    /// returned handle is still generation checked by `Dispatcher.dispatch`.
+    pub fn handleForName(self: *Registry, name: []const u8) ?ToolHandle {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.slots.items) |slot| if (slot.entry) |entry| {
+            if (std.mem.eql(u8, entry.descriptor.name, name)) return entry.handle;
+        };
+        return null;
+    }
+
     fn acquire(self: *Registry, handle: ToolHandle) ?*Entry {
         self.mutex.lock();
         defer self.mutex.unlock();
