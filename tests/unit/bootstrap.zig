@@ -7,6 +7,7 @@ comptime {
     _ = @import("tool_runtime.zig");
     _ = @import("context_session_budget.zig");
     _ = @import("trace_format.zig");
+    _ = @import("replay_diff.zig");
     _ = @import("agent_loop.zig");
     _ = @import("spindle_runtime.zig");
     _ = @import("async_operations.zig");

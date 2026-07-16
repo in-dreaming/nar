@@ -164,6 +164,11 @@ pub const Agent = struct {
     pub fn poll(self: *Agent) ?domain.AgentEvent {
         return self.mailbox.poll();
     }
+    /// Attaches an optional append-only recorder. The caller owns the writer
+    /// and must keep it alive until the agent is destroyed or detached.
+    pub fn setTraceWriter(self: *Agent, writer: ?*trace.Writer) void {
+        self.trace_writer = writer;
+    }
     pub fn cancel(self: *Agent, reason: domain.CancelReason) void {
         if (self.state == .idle or terminal(self.state)) return;
         if (self.turn) |*turn| if (turn.request) |request| request.backend.cancel(request.handle) catch {};
@@ -197,6 +202,7 @@ pub const Agent = struct {
             return .terminal;
         };
         defer built.deinit();
+        self.writeContextManifest(&built.manifest);
         turn.budget.charge(.model_calls, 1) catch |err| {
             self.finishError(err);
             return .terminal;
@@ -213,7 +219,7 @@ pub const Agent = struct {
         if (turn.tool_result) |value| self.runtime.allocator.free(value);
         turn.tool_result = null;
         self.state = .waiting_model;
-        self.writeTrace(.model_request, "{}");
+        self.writeModelRequest(built.request());
         return .progressed;
     }
     fn modelEvent(self: *Agent, turn: *Turn) TickResult {
@@ -226,6 +232,7 @@ pub const Agent = struct {
             return .terminal;
         } orelse return .would_block;
         defer event.deinit();
+        self.writeModelEvent(event);
         switch (event) {
             .start => return .progressed,
             .text_delta => |buffer| {
@@ -441,6 +448,27 @@ pub const Agent = struct {
     }
     fn writeTrace(self: *Agent, kind: trace.EventType, payload: []const u8) void {
         if (self.trace_writer) |writer| writer.appendCanonical(kind, payload) catch {};
+    }
+    fn writeModelEvent(self: *Agent, event: model.ModelEvent) void {
+        if (self.trace_writer) |writer| {
+            const payload = trace.modelEventPayload(self.runtime.allocator, event) catch return;
+            defer self.runtime.allocator.free(payload);
+            writer.appendCanonical(.model_event, payload) catch {};
+        }
+    }
+    fn writeModelRequest(self: *Agent, request: model.ModelRequest) void {
+        if (self.trace_writer) |writer| {
+            const payload = trace.modelRequestPayload(self.runtime.allocator, request) catch return;
+            defer self.runtime.allocator.free(payload);
+            writer.appendCanonical(.model_request, payload) catch {};
+        }
+    }
+    fn writeContextManifest(self: *Agent, manifest: *const context.ContextManifest) void {
+        if (self.trace_writer) |writer| {
+            const payload = std.fmt.allocPrint(self.runtime.allocator, "{{\"items\":{d}}}", .{manifest.items.len}) catch return;
+            defer self.runtime.allocator.free(payload);
+            writer.appendCanonical(.context_manifest, payload) catch {};
+        }
     }
 };
 

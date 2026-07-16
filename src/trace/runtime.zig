@@ -2,6 +2,8 @@
 const std = @import("std");
 const domain = @import("../foundation/domain.zig");
 const context = @import("../context/runtime.zig");
+const model = @import("../model/model.zig");
+const foundation = @import("foundation");
 
 pub const magic = "NARTRACE";
 pub const major_version: u16 = 1;
@@ -44,6 +46,36 @@ pub const Limits = struct { max_record_bytes: usize = 1024 * 1024, max_payload_b
 
 /// Errors reported while persisting or decoding a trace stream.
 pub const TraceError = domain.Error || error{ BadMagic, UnsupportedVersion, InvalidLength, ChecksumMismatch, SequenceMismatch, Truncated, InvalidRecordType };
+/// Replay failures never fall back to a live service.  `Diverged` means the
+/// caller did not make the same recorded decision at the same sequence.
+pub const ReplayError = TraceError || error{ Diverged, IncompleteReplay, ReplayExhausted };
+
+pub const ReplayMode = enum { strict, semantic };
+pub const DiffOptions = struct { mode: ReplayMode = .strict, redact: bool = true };
+pub const Divergence = struct {
+    sequence: u64,
+    path: []const u8,
+    expected: []const u8,
+    actual: []const u8,
+};
+
+/// Compares two complete, checksummed traces without executing any live
+/// backend. Semantic comparison permits payload changes except terminal
+/// outcomes, preserving cancellation/timeout/completion correctness.
+pub fn diff(expected_bytes: []const u8, actual_bytes: []const u8, options: DiffOptions) ReplayError!?Divergence {
+    var expected = try Reader.init(expected_bytes, .{});
+    var actual = try Reader.init(actual_bytes, .{});
+    while (true) {
+        const left = try expected.next();
+        const right = try actual.next();
+        if (left == null and right == null) return null;
+        if (left == null or right == null) return .{ .sequence = if (left) |record| record.sequence else right.?.sequence, .path = "sequence", .expected = if (options.redact) "[redacted]" else if (left) |record| record.payload else "<end>", .actual = if (options.redact) "[redacted]" else if (right) |record| record.payload else "<end>" };
+        const lhs = left.?;
+        const rhs = right.?;
+        const payload_required = options.mode == .strict or lhs.kind == .terminal or rhs.kind == .terminal;
+        if (lhs.kind != rhs.kind or (payload_required and !std.mem.eql(u8, lhs.payload, rhs.payload))) return .{ .sequence = lhs.sequence, .path = if (lhs.kind != rhs.kind) "kind" else "payload", .expected = if (options.redact) "[redacted]" else lhs.payload, .actual = if (options.redact) "[redacted]" else rhs.payload };
+    }
+}
 
 const Mutex = struct {
     state: std.atomic.Mutex = .unlocked,
@@ -213,6 +245,188 @@ pub const Reader = struct {
         return .{ .kind = kind, .schema_version = schema, .sequence = sequence, .payload = payload };
     }
 };
+
+/// A validated, immutable replay stream. The caller retains `bytes` for this
+/// object's lifetime. Access is serialized so one replay may be driven by a
+/// host pump and model poller without consuming records out of order.
+pub const ReplaySession = struct {
+    bytes: []const u8,
+    reader: Reader,
+    mode: ReplayMode,
+    terminal_seen: bool = false,
+    divergence: ?Divergence = null,
+    mutex: Mutex = .{},
+
+    pub fn init(bytes: []const u8, mode: ReplayMode) ReplayError!ReplaySession {
+        var checked = try Reader.init(bytes, .{});
+        var terminal = false;
+        while (try checked.next()) |record| {
+            if (terminal) return error.InvalidState;
+            if (record.kind == .terminal) terminal = true;
+        }
+        if (!terminal) return error.IncompleteReplay;
+        return .{ .bytes = bytes, .reader = try Reader.init(bytes, .{}), .mode = mode };
+    }
+    /// Consumes the next decision. Strict mode compares canonical payloads;
+    /// semantic mode compares event identity and terminal outcome only.
+    pub fn expect(self: *ReplaySession, kind: EventType, actual: []const u8) ReplayError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const record = try self.reader.next() orelse return error.ReplayExhausted;
+        if (record.kind != kind or ((self.mode == .strict or kind == .terminal) and !std.mem.eql(u8, record.payload, actual))) {
+            self.divergence = .{ .sequence = record.sequence, .path = if (record.kind != kind) "kind" else "payload", .expected = record.payload, .actual = actual };
+            return error.Diverged;
+        }
+        if (kind == .terminal) self.terminal_seen = true;
+    }
+    pub fn finish(self: *ReplaySession) ReplayError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.divergence != null) return error.Diverged;
+        if (!self.terminal_seen or (try self.reader.next()) != null) return error.IncompleteReplay;
+    }
+    fn nextModel(self: *ReplaySession, expected: EventType) ReplayError!Record {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const record = try self.reader.next() orelse return error.ReplayExhausted;
+        if (record.kind != expected) {
+            self.divergence = .{ .sequence = record.sequence, .path = "kind", .expected = @tagName(record.kind), .actual = @tagName(expected) };
+            return error.Diverged;
+        }
+        return record;
+    }
+};
+
+/// Canonical payload representation for a replayable model event. The payload
+/// contains only the model protocol value, never a live request handle.
+pub fn modelEventPayload(allocator: std.mem.Allocator, event: model.ModelEvent) ![]u8 {
+    return switch (event) {
+        .start => allocator.dupe(u8, "{\"type\":\"start\"}"),
+        .finish => |reason| std.fmt.allocPrint(allocator, "{{\"reason\":\"{s}\",\"type\":\"finish\"}}", .{@tagName(reason)}),
+        .usage => |usage| std.fmt.allocPrint(allocator, "{{\"input_tokens\":{d},\"output_tokens\":{d},\"type\":\"usage\"}}", .{ usage.input_tokens, usage.output_tokens }),
+        .@"error" => |code| std.fmt.allocPrint(allocator, "{{\"code\":\"{s}\",\"type\":\"error\"}}", .{@tagName(code)}),
+        .cancelled => allocator.dupe(u8, "{\"type\":\"cancelled\"}"),
+        .text_delta => |buffer| stringEvent(allocator, "text_delta", try buffer.bytes()),
+        .arguments_delta => |buffer| stringEvent(allocator, "arguments_delta", try buffer.bytes()),
+        .tool_call_end => |value| stringEvent(allocator, "tool_call_end", try value.call_id.bytes()),
+        .tool_call_start => |value| std.fmt.allocPrint(allocator, "{{\"call_id\":{f},\"name\":{f},\"type\":\"tool_call_start\"}}", .{ std.json.fmt(try value.call_id.bytes(), .{}), std.json.fmt(try value.name.bytes(), .{}) }),
+    };
+}
+/// Stable request summary used to detect context/model routing divergence
+/// without persisting prompt text.
+pub fn modelRequestPayload(allocator: std.mem.Allocator, request: model.ModelRequest) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"messages\":{d},\"model_id\":{f},\"tools\":{d}}}", .{ request.messages.len, std.json.fmt(request.model_id, .{}), request.tools.len });
+}
+fn stringEvent(allocator: std.mem.Allocator, kind: []const u8, value: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"type\":{f},\"value\":{f}}}", .{ std.json.fmt(kind, .{}), std.json.fmt(value, .{}) });
+}
+
+/// A deterministic backend driven exclusively by `ReplaySession`. Its start
+/// consumes a recorded model request and its poll consumes a model event.
+pub const ReplayBackend = struct {
+    allocator: std.mem.Allocator,
+    session: *ReplaySession,
+    descriptor_value: model.ModelDescriptor,
+    active: bool = false,
+    generation: u32 = 1,
+    cancelled: bool = false,
+    mutex: Mutex = .{},
+
+    pub fn init(allocator: std.mem.Allocator, session: *ReplaySession, descriptor_value: model.ModelDescriptor) !ReplayBackend {
+        if (descriptor_value.provider_id.len == 0 or descriptor_value.model_id.len == 0) return error.InvalidArgument;
+        return .{ .allocator = allocator, .session = session, .descriptor_value = descriptor_value };
+    }
+    pub fn backend(self: *ReplayBackend) model.Backend {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable: model.Backend.VTable = .{ .descriptor = descriptor, .start = start, .poll = poll, .cancel = cancel, .release = release };
+    fn cast(raw: *anyopaque) *ReplayBackend {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn descriptor(raw: *anyopaque) model.ModelDescriptor {
+        return cast(raw).descriptor_value;
+    }
+    fn start(raw: *anyopaque, request: model.ModelRequest) !model.ModelRequestHandle {
+        const self = cast(raw);
+        if (!std.mem.eql(u8, request.model_id, self.descriptor_value.model_id)) return error.ModelUnavailable;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.active) return error.BudgetExceeded;
+        const record = try self.session.nextModel(.model_request);
+        const actual = try modelRequestPayload(self.allocator, request);
+        defer self.allocator.free(actual);
+        if (self.session.mode == .strict and !std.mem.eql(u8, record.payload, actual)) return error.Diverged;
+        self.active = true;
+        self.cancelled = false;
+        return .{ .index = 0, .generation = self.generation };
+    }
+    fn poll(raw: *anyopaque, handle: model.ModelRequestHandle) !?model.ModelEvent {
+        const self = cast(raw);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.active or handle.index != 0 or handle.generation != self.generation) return error.InvalidState;
+        if (self.cancelled) {
+            self.cancelled = false;
+            return .{ .cancelled = {} };
+        }
+        const record = try self.session.nextModel(.model_event);
+        const event = try decodeModelEvent(self.allocator, record.payload);
+        return event;
+    }
+    fn cancel(raw: *anyopaque, handle: model.ModelRequestHandle) !void {
+        const self = cast(raw);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.active or handle.generation != self.generation) return error.InvalidState;
+        self.cancelled = true;
+    }
+    fn release(raw: *anyopaque, handle: model.ModelRequestHandle) void {
+        const self = cast(raw);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.active or handle.generation != self.generation) return;
+        self.active = false;
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
+    }
+};
+
+fn decodeModelEvent(allocator: std.mem.Allocator, payload: []const u8) !model.ModelEvent {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.ModelProtocolError,
+    };
+    const name = try jsonString(object, "type");
+    if (std.mem.eql(u8, name, "start")) return .{ .start = {} };
+    if (std.mem.eql(u8, name, "cancelled")) return .{ .cancelled = {} };
+    if (std.mem.eql(u8, name, "finish")) return .{ .finish = std.meta.stringToEnum(model.FinishReason, try jsonString(object, "reason")) orelse return error.ModelProtocolError };
+    if (std.mem.eql(u8, name, "error")) return .{ .@"error" = std.meta.stringToEnum(domain.ErrorCode, try jsonString(object, "code")) orelse return error.ModelProtocolError };
+    if (std.mem.eql(u8, name, "usage")) return .{ .usage = .{ .input_tokens = @intCast(try jsonUnsigned(object, "input_tokens")), .output_tokens = @intCast(try jsonUnsigned(object, "output_tokens")) } };
+    if (std.mem.eql(u8, name, "text_delta")) return .{ .text_delta = try replayBuffer(allocator, object) };
+    if (std.mem.eql(u8, name, "arguments_delta")) return .{ .arguments_delta = try replayBuffer(allocator, object) };
+    if (std.mem.eql(u8, name, "tool_call_end")) return .{ .tool_call_end = .{ .call_id = try replayBuffer(allocator, object) } };
+    if (std.mem.eql(u8, name, "tool_call_start")) return .{ .tool_call_start = .{ .call_id = try foundation.memory.SharedBuffer.initCopy(allocator, try jsonString(object, "call_id"), .general), .name = try foundation.memory.SharedBuffer.initCopy(allocator, try jsonString(object, "name"), .general) } };
+    return error.ModelProtocolError;
+}
+fn replayBuffer(allocator: std.mem.Allocator, object: std.json.ObjectMap) !foundation.memory.SharedBuffer {
+    return foundation.memory.SharedBuffer.initCopy(allocator, try jsonString(object, "value"), .general);
+}
+fn jsonString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    return switch (object.get(key) orelse return error.ModelProtocolError) {
+        .string => |value| value,
+        else => error.ModelProtocolError,
+    };
+}
+fn jsonUnsigned(object: std.json.ObjectMap, key: []const u8) !u64 {
+    const value = switch (object.get(key) orelse return error.ModelProtocolError) {
+        .integer => |integer| integer,
+        else => return error.ModelProtocolError,
+    };
+    if (value < 0) return error.ModelProtocolError;
+    return @intCast(value);
+}
 
 fn sanitize(allocator: std.mem.Allocator, arguments: []const u8, policy: SensitivePolicy) TraceError![]u8 {
     return switch (policy) {
