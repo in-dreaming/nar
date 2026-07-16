@@ -11,18 +11,11 @@ $ErrorActionPreference = "Stop"
 $TaskDirectory = $PSScriptRoot
 $SetupDocument = Join-Path $TaskDirectory "setup.md"
 $TaskDocuments = @(
-    "00-bootstrap.md",
-    "01-foundation-domain.md",
-    "02-model-stream.md",
-    "03-tool-runtime.md",
-    "04-context-session-budget.md",
-    "05-trace-format.md",
-    "06-agent-loop.md",
-    "07-async-operations.md",
-    "08-openai-compatible.md",
-    "09-replay-diff.md",
-    "10-c-abi.md",
-    "11-spindle-adapter.md",
+    "07-spindle-runtime-migration.md",
+    "08-async-operations.md",
+    "09-openai-compatible.md",
+    "10-replay-diff.md",
+    "11-c-abi.md",
     "12-runtime-acceptance.md"
 )
 

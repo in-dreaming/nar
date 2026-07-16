@@ -1,35 +1,34 @@
-# 12 - 首版 Runtime 端到端验收、示例与发布检查
+# 12 - 首版端到端验收、示例与发布检查
 
 ## 目的
 
-聚合首版能力，验证真实嵌入路径、失败路径、裁剪和文档，不新增架构范围。
+聚合 spindle 驱动的首版能力，验证真实 Zig/C 嵌入、profile 裁剪、异步/取消/Replay 与安全边界，不新增产品范围。
 
 ## 依赖
 
-- 08 OpenAI-compatible。
-- 09 Replay。
-- 10 C ABI。
-- 11 spindle adapter。
+- 09 OpenAI-compatible、10 Replay、11 C ABI。
 
 ## 实现方案
 
-1. 完成 Zig `examples/minimal_agent`：Mock model 查询玩家状态、发起异步移动、等待完成、输出 final；演示事件 pull、取消和完整 deinit。
-2. 完成 `examples/c_api`，与真实 `include/nar.h` 一致并纳入 check。
-3. 建立 runtime integration fixture：Agent 发起 `move_to` pending operation，宿主多帧 pump；角色死亡事件触发 cancel；另一场景成功完成并生成 trace。
-4. 对成功 trace 在全新 Runtime 中 replay，live model/tool callback 设置为调用即失败；比较 event/session/outcome。
-5. 使用本地 OpenAI fixture 完成一轮文本+tool streaming；不需要真实 API key/公网。
-6. 验证 minimal/runtime/runtime+spindle 构建裁剪。提供可检查的编译或符号证据，minimal 不含 HTTP/trace-file/spindle。
-7. 补齐 README 和 `docs/`：快速开始、模块图、线程模型、所有权、C ABI、profile、安全默认值、Trace schema/version、已知限制。
-8. 增加 release check：格式、测试、C/C++ header、示例、公开 API 文档、禁止 TODO/FIXME、子模块 clean。不要设置未经基准验证的性能阈值。
+1. `examples/minimal_agent` 使用无线程 minimal Host + Mock，完成 query -> sync action -> final。
+2. `examples/runtime_agent` 创建地址稳定 spindle Host，完成 query -> async move（compute）-> main-thread confirmation（pump）-> final；展示 staged shutdown。
+3. `examples/c_api` 与真实 header 一致，完成 async/pump 场景并释放全部 handle/buffer。
+4. 集成 fixture：成功 async move；角色死亡时 waiting_operation cancel；pump deadline；resource graph 并行只读和写 hazard；shutdown active task。
+5. 成功/取消 trace 在 fresh Replay Runtime 复现，live model/tool/HTTP/spindle callback 调用为零。
+6. 本地 OpenAI fixture 完成 streaming text+tool，不需要公网/key。
+7. `test-feature-matrix` 用编译与符号证据验证：minimal 无 thread/task/resource/HTTP/workflow；runtime 有 task/resource/HTTP，但无 ECS/workflow/SQLite/archive。
+8. README/docs 补齐快速开始、模块图、Host ownership、线程模型、pump、取消、C ABI、profile、安全默认、Trace schema、spindle feature 和已知限制。
+9. release check 聚合 fmt、测试、feature matrix、C/C++ header、示例、公开 API 文档、TODO/FIXME、gitlink 与 submodule clean。不设置未经基准验证的性能阈值。
 
 ## 验收场景
 
-- 成功：query -> async move -> operation complete -> final，事件/Trace/Session 一致。
-- 取消：waiting_operation 时角色死亡，operation 和 turn 均 cancelled，late complete 被拒绝。
-- 安全：无 capability、stale ObjectRef、stale WorldRevision 均在 callback 前拒绝。
-- 预算：tool/model/wall/trace 任一超限产生唯一 terminal。
+- 成功：query -> async move -> pump tool -> final；AgentEvent/Trace/Session/resource order 一致。
+- 取消：waiting_operation 时 owner destroyed，NAR token、spindle Task、Turn 唯一 cancelled；late completion 拒绝。
+- 安全：capability、schema、stale ObjectRef/WorldRevision/resource constraint 均在 callback 前拒绝。
+- 预算：model/tool/wall/trace/pump 任一超限唯一 terminal。
+- Shutdown：finite deadline report 可观察，最终 deinit 无 worker/task/operation/pump outstanding。
 - Replay：离线结果一致，live 调用为零。
-- C ABI：C consumer 完成成功场景并释放所有 buffer/handle。
+- C ABI：runtime/minimal consumer 均通过并释放所有资源。
 
 ## 完成校验
 
@@ -37,14 +36,14 @@
 zig fmt --check build.zig src tests examples adapters
 zig build check -Dprofile=minimal
 zig build check -Dprofile=runtime
-zig build check -Dprofile=runtime -Dspindle=true
 zig build test
 zig build test-integration
 zig build test-cabi
+zig build test-feature-matrix
 zig build test-all
 git diff --check
 rg -n "TODO|FIXME" src tests examples adapters include
 git status --short deps/fund deps/spindle
 ```
 
-`rg` 无匹配时退出码 1 是期望结果。所有命令通过且示例实际运行后才可提交。
+`rg` 无匹配时退出码 1 是期望结果。全部命令和示例通过后才可提交。
