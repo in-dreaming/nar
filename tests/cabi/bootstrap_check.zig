@@ -43,6 +43,11 @@ test "C ABI tool handles are generational and registration copies descriptors" {
     try expectCode(c.NAR_OK, abi.nar_tool_register(runtime, @ptrCast(&descriptor), @ptrCast(&callback), null, &tool));
     try expectCode(c.NAR_OK, abi.nar_tool_unregister(runtime, tool));
     try expectCode(c.NAR_INVALID_STATE, abi.nar_tool_unregister(runtime, tool));
+
+    var resource = c.nar_resource_access{ .struct_size = @sizeOf(c.nar_resource_access), .api_version = c.NAR_API_VERSION, .key = .{ .kind = c.NAR_RESOURCE_CUSTOM, .reserved = 0, .namespace_high = 0, .namespace_low = 0, .name = .{ .data = "world".ptr, .size = 5 }, .page = 0 }, .mode = c.NAR_RESOURCE_WRITE, .range_kind = c.NAR_RANGE_BYTE, .version_kind = c.NAR_VERSION_ANY, .reserved = 0, .range_start = 4, .range_end = 4, .version_value = 0 };
+    descriptor.resources = &resource;
+    descriptor.resource_count = 1;
+    try expectCode(c.NAR_INVALID_ARGUMENT, abi.nar_tool_register(runtime, @ptrCast(&descriptor), @ptrCast(&callback), null, &tool));
 }
 
 fn appendModelEvent(writer: *nar.trace.Writer, event_value: nar.model.ModelEvent) !void {
@@ -66,6 +71,7 @@ fn toolReplayTrace() ![]u8 {
     } });
     try appendModelEvent(&writer, .{ .arguments_delta = try @import("foundation").memory.SharedBuffer.initCopy(std.testing.allocator, "{}", .general) });
     try appendModelEvent(&writer, .{ .tool_call_end = .{ .call_id = try @import("foundation").memory.SharedBuffer.initCopy(std.testing.allocator, "confirm-1", .general) } });
+    try writer.appendToolCall("confirm_main", "{}", .hash);
     try writer.appendCanonical(.tool_result, "{}");
     try writer.appendCanonical(.model_request, "{}");
     try appendModelEvent(&writer, .{ .start = {} });
@@ -83,7 +89,7 @@ fn asyncMainCallback(invocation: *const c.nar_invocation, sink: *c.nar_result_si
     _ = sink.complete.?(sink, .{ .data = result.ptr, .size = result.len });
 }
 
-test "C replay runtime drives an async main-thread tool only through pump" {
+test "C replay runtime never invokes live tool or pump callbacks" {
     const bytes = try toolReplayTrace();
     defer std.testing.allocator.free(bytes);
     var cfg = config();
@@ -112,8 +118,8 @@ test "C replay runtime drives an async main-thread tool only through pump" {
     try std.testing.expectEqual(@as(usize, 0), calls);
     var jobs: usize = 0;
     try expectCode(c.NAR_OK, abi.nar_runtime_pump_main_thread(runtime, 1, std.time.ns_per_s, &jobs));
-    try std.testing.expectEqual(@as(usize, 1), jobs);
-    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 0), jobs);
+    try std.testing.expectEqual(@as(usize, 0), calls);
     for (0..16) |_| {
         try expectCode(c.NAR_OK, abi.nar_agent_tick(runtime, agent, &tick));
         if (tick == c.NAR_TICK_TERMINAL) break;

@@ -153,6 +153,7 @@ fn agentConfig() core.AgentConfig {
         .definition = .{
             .system_context = "Use registered tools.",
             .model_id = "agent-test",
+            .allowed_tools = &.{ "query_player", "move_to" },
             .default_budget = .{ .model_calls = 4, .tool_calls = 3, .output_tokens = 32 },
         },
     };
@@ -245,4 +246,87 @@ test "arguments without a tool call fail with a protocol terminal" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), failure_count);
+}
+
+test "agent does not consume model events while mailbox is full" {
+    var backend = ScriptBackend{ .allocator = std.testing.allocator, .mode = .tool_sequence, .next_request = 2 };
+    var runtime = try core.Runtime.init(std.testing.allocator, .{ .mailbox_capacity = 1 });
+    defer runtime.deinit();
+    try runtime.models.register(backend.backend());
+    const agent = try runtime.createAgent(agentConfig());
+    var world = try snapshot();
+    defer world.deinit();
+    _ = try agent.submit(.{ .input = "answer", .world = &world });
+    try std.testing.expectEqual(core.TickResult.progressed, agent.tick());
+    try std.testing.expectEqual(core.TickResult.progressed, agent.tick());
+    try std.testing.expectEqual(core.TickResult.progressed, agent.tick());
+    try std.testing.expectEqual(core.TickResult.would_block, agent.tick());
+    var text = agent.poll().?;
+    defer text.deinit();
+    try std.testing.expect(text.payload == .text_delta);
+    try std.testing.expectEqual(core.TickResult.terminal, agent.tick());
+    var final = agent.poll().?;
+    defer final.deinit();
+    try std.testing.expect(final.payload == .final_response);
+}
+
+test "agent execution enforces allowed tools and capabilities" {
+    var backend = ScriptBackend{ .allocator = std.testing.allocator, .mode = .tool_sequence };
+    var runtime = try core.Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try runtime.models.register(backend.backend());
+    var state = ToolState{};
+    _ = try runtime.tools.register(.{ .name = "query_player", .input_schema = "{\"type\":\"object\"}", .required_capabilities = .{ .bits = 1 } }, queryPlayer, &state);
+    var config = agentConfig();
+    config.definition.allowed_tools = &.{"query_player"};
+    config.capabilities = .{ .bits = 0 };
+    config.tool_error_policy = .fail_turn;
+    const agent = try runtime.createAgent(config);
+    var world = try snapshot();
+    defer world.deinit();
+    _ = try agent.submit(.{ .input = "query", .world = &world });
+    for (0..12) |_| if (agent.tick() == .terminal) break;
+    try std.testing.expectEqual(core.TurnState.failed, agent.state);
+    try std.testing.expectEqual(@as(u32, 0), state.query_calls);
+
+    var denied_backend = ScriptBackend{ .allocator = std.testing.allocator, .mode = .tool_sequence };
+    var denied_runtime = try core.Runtime.init(std.testing.allocator, .{});
+    defer denied_runtime.deinit();
+    try denied_runtime.models.register(denied_backend.backend());
+    _ = try denied_runtime.tools.register(.{ .name = "query_player", .input_schema = "{\"type\":\"object\"}" }, queryPlayer, &state);
+    config.definition.allowed_tools = &.{"move_to"};
+    const denied = try denied_runtime.createAgent(config);
+    _ = try denied.submit(.{ .input = "query", .world = &world });
+    for (0..12) |_| if (denied.tick() == .terminal) break;
+    try std.testing.expectEqual(core.TurnState.failed, denied.state);
+    try std.testing.expectEqual(@as(u32, 0), state.query_calls);
+}
+
+test "trace sink failure fails closed before model dispatch" {
+    const FailingSink = struct {
+        appends: usize = 0,
+        fn append(raw: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.appends += 1;
+            if (self.appends > 1) return error.StorageUnavailable;
+        }
+    };
+    var backend = ScriptBackend{ .allocator = std.testing.allocator, .mode = .pending };
+    var runtime = try core.Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try runtime.models.register(backend.backend());
+    const agent = try runtime.createAgent(agentConfig());
+    var sink = FailingSink{};
+    var writer = try nar.trace.Writer.init(std.testing.allocator, .{ .context = &sink, .append_fn = FailingSink.append }, .{ .session_id = 9, .runtime_id = nar.RuntimeId.init(9).? }, .{});
+    defer writer.deinit();
+    agent.setTraceWriter(&writer);
+    var world = try snapshot();
+    defer world.deinit();
+    _ = try agent.submit(.{ .input = "trace", .world = &world });
+    try std.testing.expectEqual(core.TickResult.terminal, agent.tick());
+    try std.testing.expectEqual(core.TurnState.failed, agent.state);
+    try std.testing.expect(!backend.active);
+    var terminal = agent.poll().?;
+    defer terminal.deinit();
+    try std.testing.expect(terminal.payload == .failed and terminal.payload.failed == .storage_error);
 }

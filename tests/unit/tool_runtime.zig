@@ -14,7 +14,7 @@ fn pending(_: ?*anyopaque, _: tool.InvocationContext) !tool.CallbackResult {
 fn typedFailure(_: ?*anyopaque, _: tool.InvocationContext) !tool.CallbackResult {
     return .{ .failure = .operation_failed };
 }
-fn rejectStale(_: ?*anyopaque, _: tool.ToolDescriptor, target: ?nar.ObjectRef, revision: nar.WorldRevision) nar.Error!void {
+fn rejectStale(_: ?*anyopaque, _: tool.ToolDescriptor, _: *const std.json.Value, target: ?nar.ObjectRef, revision: nar.WorldRevision) nar.Error!void {
     if (target == null or !target.?.isValid()) return error.StaleObject;
     if (!revision.isValid()) return error.StaleWorldRevision;
 }

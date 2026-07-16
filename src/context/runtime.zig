@@ -174,7 +174,7 @@ pub const ToolResolver = struct {
             selected.deinit(allocator);
         }
         for (descriptors) |descriptor| {
-            if (self.allowed_names.len != 0 and !contains(self.allowed_names, descriptor.name)) continue;
+            if (!contains(self.allowed_names, descriptor.name)) continue;
             if (!self.capabilities.contains(descriptor.required_capabilities) or (self.shipping and descriptor.flags.debug_only)) continue;
             if ((!self.runtime_profile and !descriptor.profiles.minimal) or (self.runtime_profile and !descriptor.profiles.runtime)) continue;
             const name = try allocator.dupe(u8, descriptor.name);

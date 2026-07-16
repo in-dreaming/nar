@@ -36,7 +36,7 @@ pub fn main() !void {
     var tools = ToolState{ .host = &host };
     _ = try host.runtime().tools.register(.{ .name = "move_async", .input_schema = "{\"type\":\"object\",\"required\":[\"x\"],\"properties\":{\"x\":{\"type\":\"integer\"}}}" }, moveAsync, &tools);
     _ = try host.runtime().tools.register(.{ .name = "confirm_main", .input_schema = "{\"type\":\"object\"}" }, confirmMain, &tools);
-    const agent = try host.runtime().createAgent(.{ .provider_id = "example", .definition = .{ .model_id = "script", .system_context = "Move, confirm, then answer.", .default_budget = .{ .model_calls = 3, .tool_calls = 2, .output_tokens = 16 } } });
+    const agent = try host.runtime().createAgent(.{ .provider_id = "example", .definition = .{ .model_id = "script", .system_context = "Move, confirm, then answer.", .allowed_tools = &.{ "move_async", "confirm_main" }, .default_budget = .{ .model_calls = 3, .tool_calls = 2, .output_tokens = 16 } } });
     var world = try nar.context.WorldSnapshot.initCopy(allocator, nar.WorldRevision.fromInt(1), .{ .nanoseconds = host.runtime().config.services.clock.now() }, &.{});
     defer world.deinit();
     _ = try agent.submit(.{ .input = "Move to x=4.", .world = &world });

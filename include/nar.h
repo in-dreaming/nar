@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define NAR_API_VERSION UINT32_C(1)
+#define NAR_API_VERSION UINT32_C(2)
 
 typedef uint64_t nar_runtime_handle;
 typedef uint64_t nar_agent_handle;
@@ -34,11 +34,25 @@ typedef enum nar_thread_affinity { NAR_THREAD_ANY = 0, NAR_THREAD_MAIN = 1, NAR_
 typedef enum nar_cancel_reason { NAR_CANCEL_REQUESTED = 0, NAR_CANCEL_TIMEOUT = 1, NAR_CANCEL_SHUTDOWN = 2, NAR_CANCEL_OWNER_DESTROYED = 3 } nar_cancel_reason;
 typedef enum nar_tick_result { NAR_TICK_PROGRESSED = 0, NAR_TICK_WOULD_BLOCK = 1, NAR_TICK_TERMINAL = 2 } nar_tick_result;
 typedef enum nar_event_kind { NAR_EVENT_NONE = 0, NAR_EVENT_TEXT_DELTA = 1, NAR_EVENT_FINAL_RESPONSE = 2, NAR_EVENT_TOOL_COMPLETED = 3, NAR_EVENT_OPERATION_PROGRESS = 4, NAR_EVENT_FAILED = 5, NAR_EVENT_CANCELLED = 6, NAR_EVENT_SYSTEM = 7 } nar_event_kind;
+typedef enum nar_resource_kind { NAR_RESOURCE_FILE = 0, NAR_RESOURCE_PAGE = 1, NAR_RESOURCE_MEMORY_BUFFER = 2, NAR_RESOURCE_DATABASE_SEGMENT = 3, NAR_RESOURCE_GPU_BUFFER = 4, NAR_RESOURCE_TEXTURE = 5, NAR_RESOURCE_NETWORK_BLOB = 6, NAR_RESOURCE_CUSTOM = 7 } nar_resource_kind;
+typedef enum nar_resource_mode { NAR_RESOURCE_READ = 0, NAR_RESOURCE_WRITE = 1, NAR_RESOURCE_CREATE = 2, NAR_RESOURCE_DELETE = 3 } nar_resource_mode;
+typedef enum nar_resource_range_kind { NAR_RANGE_WHOLE = 0, NAR_RANGE_PAGE = 1, NAR_RANGE_BYTE = 2 } nar_resource_range_kind;
+typedef enum nar_version_constraint_kind { NAR_VERSION_ANY = 0, NAR_VERSION_MUST_NOT_EXIST = 1, NAR_VERSION_EXACT = 2, NAR_VERSION_GENERATION = 3 } nar_version_constraint_kind;
 
-typedef struct nar_slice { const uint8_t *data; size_t size; } nar_slice;
+typedef struct nar_slice { const uint8_t *data; uint64_t size; } nar_slice;
 typedef struct nar_buffer nar_buffer;
 typedef void (*nar_buffer_release_fn)(nar_buffer *buffer);
-struct nar_buffer { const uint8_t *data; size_t size; nar_buffer_release_fn release; void *userdata; };
+struct nar_buffer { const uint8_t *data; uint64_t size; nar_buffer_release_fn release; void *userdata; };
+
+typedef nar_error_code (*nar_validate_dispatch_fn)(nar_slice tool_name, nar_slice arguments_json, uint64_t world_revision, void *userdata);
+typedef struct nar_resource_key {
+    uint32_t kind, reserved;
+    uint64_t namespace_high, namespace_low;
+    nar_slice name;
+    uint64_t page;
+} nar_resource_key;
+typedef struct nar_resource_version { uint64_t generation, content_hash; uint32_t exists, has_content_hash; } nar_resource_version;
+typedef nar_error_code (*nar_resolve_resource_fn)(const nar_resource_key *, nar_resource_version *, void *userdata);
 
 typedef struct nar_runtime_config {
     uint32_t struct_size, api_version;
@@ -46,15 +60,25 @@ typedef struct nar_runtime_config {
     uint32_t reserved0;
     uint64_t max_agents, mailbox_capacity, operation_capacity;
     uint64_t compute_workers, blocking_workers, queue_capacity, observability_capacity;
+    uint64_t build_capabilities, shipping_capabilities, project_capabilities, runtime_capabilities;
+    uint32_t shipping, reserved1;
+    nar_validate_dispatch_fn validate_dispatch;
+    nar_resolve_resource_fn resolve_resource;
+    void *host_userdata;
 } nar_runtime_config;
 
 typedef struct nar_budget { uint64_t wall_time_ns, model_calls, tool_calls, context_tokens, output_tokens, cost_micros, trace_bytes; } nar_budget;
-typedef struct nar_resource_access { uint64_t key; uint32_t mode; uint32_t reserved; } nar_resource_access;
+typedef struct nar_resource_access {
+    uint32_t struct_size, api_version;
+    nar_resource_key key;
+    uint32_t mode, range_kind, version_kind, reserved;
+    uint64_t range_start, range_end, version_value;
+} nar_resource_access;
 typedef struct nar_tool_descriptor {
     uint32_t struct_size, api_version;
     nar_slice name, description, version, input_schema, output_schema;
     uint64_t required_capabilities;
-    const nar_resource_access *resources; size_t resource_count;
+    const nar_resource_access *resources; uint64_t resource_count;
     nar_thread_affinity thread_affinity;
     uint32_t flags, profile_mask, revision_policy;
 } nar_tool_descriptor;
@@ -68,13 +92,13 @@ typedef void (*nar_tool_callback)(const nar_invocation *, nar_result_sink *, voi
 typedef struct nar_agent_config {
     uint32_t struct_size, api_version;
     nar_slice provider_id, model_id, system_context, static_context;
-    const nar_slice *allowed_tools; size_t allowed_tool_count;
+    const nar_slice *allowed_tools; uint64_t allowed_tool_count;
     nar_budget budget;
-    uint64_t max_repeated_tool_calls;
+    uint64_t max_repeated_tool_calls, capabilities;
     uint32_t tool_error_policy, reserved;
 } nar_agent_config;
 typedef struct nar_world_section { nar_slice name, payload; } nar_world_section;
-typedef struct nar_submit_request { uint32_t struct_size, api_version; nar_slice input; uint64_t world_revision, captured_at_ns; const nar_world_section *sections; size_t section_count; } nar_submit_request;
+typedef struct nar_submit_request { uint32_t struct_size, api_version; nar_slice input; uint64_t world_revision, captured_at_ns; const nar_world_section *sections; uint64_t section_count; } nar_submit_request;
 typedef struct nar_event { uint32_t struct_size, api_version; nar_event_kind kind; uint32_t reserved; uint64_t sequence, turn, timestamp_ns, operation; nar_error_code error; nar_cancel_reason cancel_reason; nar_buffer buffer; } nar_event;
 
 uint32_t nar_api_version(void);
@@ -93,7 +117,7 @@ nar_error_code nar_agent_create(nar_runtime_handle, const nar_agent_config *, na
 nar_error_code nar_agent_destroy(nar_runtime_handle, nar_agent_handle);
 nar_error_code nar_agent_submit(nar_runtime_handle, nar_agent_handle, const nar_submit_request *, nar_turn_handle *);
 nar_error_code nar_agent_tick(nar_runtime_handle, nar_agent_handle, nar_tick_result *);
-nar_error_code nar_runtime_pump_main_thread(nar_runtime_handle, size_t max_jobs, uint64_t max_nanos, size_t *completed_jobs);
+nar_error_code nar_runtime_pump_main_thread(nar_runtime_handle, uint64_t max_jobs, uint64_t max_nanos, uint64_t *completed_jobs);
 nar_error_code nar_agent_poll(nar_runtime_handle, nar_agent_handle, nar_event *);
 nar_error_code nar_agent_cancel(nar_runtime_handle, nar_agent_handle, nar_cancel_reason);
 nar_error_code nar_operation_complete(nar_runtime_handle, nar_operation_handle, nar_slice);

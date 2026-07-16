@@ -76,6 +76,34 @@ test "OpenAI backend maps SSE text, split tool arguments, tool end, and one term
     try std.testing.expectEqual(@as(usize, 1), terminal_count);
 }
 
+test "OpenAI backend exposes deltas before the HTTP terminal" {
+    var mock = foundation.http.MockClient.init(std.testing.allocator);
+    defer mock.deinit();
+    var immediate = foundation.executor.ImmediateExecutor{};
+    var value = try backend(&mock, immediate.executor(), 1, 4096);
+    defer value.deinit();
+    try mock.append(.{ .chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"early\"}}]}\n\n" });
+    try mock.append(.{ .chunk = "data: [DONE]\n\n" });
+    try mock.append(.{ .response = .{ .body = "" } });
+    const handle = try value.start(request());
+    defer value.release(handle);
+    mock.pump();
+    var start = (try value.poll(handle)).?;
+    defer start.deinit();
+    try std.testing.expect(start == .start);
+    var delta = (try value.poll(handle)).?;
+    defer delta.deinit();
+    try std.testing.expect(delta == .text_delta);
+    try std.testing.expectEqualStrings("early", try delta.text_delta.bytes());
+    try std.testing.expect((try value.poll(handle)) == null);
+    mock.pump();
+    var finish = (try value.poll(handle)).?;
+    defer finish.deinit();
+    try std.testing.expect(finish == .finish);
+    mock.pump();
+    try std.testing.expect((try value.poll(handle)) == null);
+}
+
 test "OpenAI backend maps transport failures, cancellation, and response limits" {
     var mock = foundation.http.MockClient.init(std.testing.allocator);
     defer mock.deinit();

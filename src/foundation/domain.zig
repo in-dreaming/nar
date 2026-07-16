@@ -295,6 +295,7 @@ pub const EventMailbox = struct {
     count: usize = 0,
     next_sequence: u64 = 1,
     closed: bool = false,
+    terminal: ?AgentEvent = null,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !EventMailbox {
         if (capacity == 0) return error.InvalidCapacity;
@@ -309,6 +310,11 @@ pub const EventMailbox = struct {
             var owned = event;
             owned.deinit();
         }
+        if (self.terminal) |event| {
+            var owned = event;
+            owned.deinit();
+            self.terminal = null;
+        }
         self.allocator.free(self.items);
         self.items = &.{};
         self.closed = true;
@@ -321,7 +327,14 @@ pub const EventMailbox = struct {
     pub fn len(self: *EventMailbox) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.count;
+        return self.count + @intFromBool(self.terminal != null);
+    }
+    /// Reports whether a normal event can be accepted without consuming it
+    /// from an upstream pull source. Terminal events use their reserved slot.
+    pub fn canAccept(self: *EventMailbox) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return !self.closed and self.count < self.items.len;
     }
     /// On an error, `event` remains caller-owned and must be deinitialized by
     /// the caller. On success the mailbox owns it, including after coalescing.
@@ -330,11 +343,15 @@ pub const EventMailbox = struct {
         defer self.mutex.unlock();
         if (self.closed) return error.Closed;
         if (tryMergeTail(self, event)) return;
-        if (self.count == self.items.len) return error.Backpressure;
+        if (self.count == self.items.len) {
+            if (!event.isTerminal() or self.terminal != null) return error.Backpressure;
+            var terminal_event = event;
+            terminal_event.sequence = self.nextSequenceLocked();
+            self.terminal = terminal_event;
+            return;
+        }
         var owned = event;
-        owned.sequence = self.next_sequence;
-        self.next_sequence +%= 1;
-        if (self.next_sequence == 0) self.next_sequence = 1;
+        owned.sequence = self.nextSequenceLocked();
         self.items[self.tail] = owned;
         self.tail = (self.tail + 1) % self.items.len;
         self.count += 1;
@@ -343,7 +360,10 @@ pub const EventMailbox = struct {
     pub fn poll(self: *EventMailbox) ?AgentEvent {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.popLocked();
+        return self.popLocked() orelse if (self.terminal) |event| blk: {
+            self.terminal = null;
+            break :blk event;
+        } else null;
     }
 
     fn popLocked(self: *EventMailbox) ?AgentEvent {
@@ -380,5 +400,11 @@ pub const EventMailbox = struct {
         discarded.deinit();
         previous.payload = .{ .text_delta = merged };
         return true;
+    }
+    fn nextSequenceLocked(self: *EventMailbox) u64 {
+        const result = self.next_sequence;
+        self.next_sequence +%= 1;
+        if (self.next_sequence == 0) self.next_sequence = 1;
+        return result;
     }
 };

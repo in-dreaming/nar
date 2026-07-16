@@ -43,6 +43,8 @@ pub const core = @import("core/agent_loop.zig");
 /// Spindle-backed production and deterministic test hosts. A host owns its
 /// Spindle runtime while `core.Runtime` only borrows the exposed services.
 pub const spindle = @import("adapters/spindle/host.zig");
+/// Runtime-profile resource scheduling. It is absent from minimal builds.
+pub const resource = if (build_options.runtime) @import("adapters/spindle/resource.zig") else struct {};
 
 /// Host-owned asynchronous operation registry and executor affinity contracts.
 pub const operation = @import("runtime/operation.zig");

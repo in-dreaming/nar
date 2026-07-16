@@ -22,6 +22,7 @@ pub const Config = struct {
     allowed_origins: []const []const u8 = &.{},
     headers: ?HeaderProvider = null,
     header_context: ?*anyopaque = null,
+    connect_timeout_ms: u64 = 10_000,
     timeout_ms: u64 = 30_000,
     first_byte_timeout_ms: u64 = 10_000,
     response_limit: usize = 1024 * 1024,
@@ -37,7 +38,9 @@ const Slot = struct {
     active: bool = false,
     terminal: bool = false,
     cancelled: bool = false,
+    started: bool = false,
     operation: ?*foundation.http.HttpOperation = null,
+    parser: ?foundation.sse.Parser = null,
     callback: Callback = undefined,
     queue: std.ArrayListUnmanaged(Queued) = .empty,
     tool_ids: [16]?[]u8 = [_]?[]u8{null} ** 16,
@@ -50,7 +53,10 @@ const Slot = struct {
         self.active = false;
         self.terminal = false;
         self.cancelled = false;
+        self.started = false;
         self.operation = null;
+        if (self.parser) |*parser| parser.deinit();
+        self.parser = null;
         self.tool_ids = [_]?[]u8{null} ** 16;
         self.tool_names = [_]?[]u8{null} ** 16;
     }
@@ -138,9 +144,10 @@ pub const Backend = struct {
         for (self.slots, 0..) |*slot, index| if (!slot.active) {
             slot.reset(self.allocator);
             slot.active = true;
+            slot.parser = foundation.sse.Parser.init(self.allocator, .{ .max_field_bytes = self.config.event_limit, .max_event_bytes = self.config.event_limit }, .reject);
             const handle = model.ModelRequestHandle{ .index = @intCast(index), .generation = slot.generation };
             slot.callback = .{ .backend = self, .handle = handle };
-            slot.operation = self.http.start(self.allocator, .{ .url = self.config.base_url, .method = .post, .headers = headers.items, .body = body }, .{ .timeout_ms = @min(self.config.timeout_ms, self.config.first_byte_timeout_ms), .response_body_limit = self.config.response_limit, .redirects = .deny, .executor = self.completion_executor }, completed, &slot.callback) catch |err| {
+            slot.operation = self.http.startStream(self.allocator, .{ .url = self.config.base_url, .method = .post, .headers = headers.items, .body = body }, .{ .connect_timeout_ms = self.config.connect_timeout_ms, .first_byte_timeout_ms = self.config.first_byte_timeout_ms, .timeout_ms = self.config.timeout_ms, .response_body_limit = self.config.response_limit, .redirects = .deny, .executor = self.completion_executor }, .{ .callback = streamData, .context = &slot.callback }, completed, &slot.callback) catch |err| {
                 slot.reset(self.allocator);
                 return err;
             };
@@ -211,13 +218,12 @@ pub const Backend = struct {
                     slot.terminal = true;
                     return;
                 }
-                const bytes = response.body.bytes() catch {
-                    self.push(slot, .{ .@"error" = .internal_error });
-                    slot.terminal = true;
+                var parse_context = ParseContext{ .backend = self, .slot = slot };
+                if (slot.parser) |*parser| parser.finish(onSse, &parse_context) catch {
+                    self.protocol(slot);
                     return;
                 };
-                self.push(slot, .{ .start = {} });
-                self.parse(slot, bytes);
+                if (!slot.terminal) self.protocol(slot);
             },
         }
     }
@@ -238,20 +244,6 @@ pub const Backend = struct {
         }
         slot.queue.appendAssumeCapacity(.{ .event = event });
     }
-    fn parse(self: *Backend, slot: *Slot, bytes: []const u8) void {
-        var parser = foundation.sse.Parser.init(self.allocator, .{ .max_field_bytes = self.config.event_limit, .max_event_bytes = self.config.event_limit }, .reject);
-        defer parser.deinit();
-        var context = ParseContext{ .backend = self, .slot = slot };
-        parser.feed(bytes, onSse, &context) catch {
-            self.protocol(slot);
-            return;
-        };
-        parser.finish(onSse, &context) catch {
-            self.protocol(slot);
-            return;
-        };
-        if (!slot.terminal) self.protocol(slot);
-    }
     fn protocol(self: *Backend, slot: *Slot) void {
         if (!slot.terminal) {
             self.push(slot, .{ .@"error" = .model_protocol_error });
@@ -259,6 +251,26 @@ pub const Backend = struct {
         }
     }
 };
+
+fn streamData(raw: ?*anyopaque, bytes: []const u8) foundation.http.StreamError!void {
+    const callback: *Callback = @ptrCast(@alignCast(raw.?));
+    const self = callback.backend;
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const slot = self.requestSlot(callback.handle) catch return error.InvalidData;
+    if (slot.cancelled or slot.terminal) return error.Backpressure;
+    if (!slot.started) {
+        self.push(slot, .{ .start = {} });
+        slot.started = true;
+    }
+    var parse_context = ParseContext{ .backend = self, .slot = slot };
+    if (slot.parser) |*parser| parser.feed(bytes, onSse, &parse_context) catch {
+        self.protocol(slot);
+        return error.InvalidData;
+    } else return error.InvalidData;
+    if (slot.terminal) return;
+    if (slot.queue.items.len >= self.config.queue_capacity) return error.Backpressure;
+}
 
 const ParseContext = struct { backend: *Backend, slot: *Slot };
 fn onSse(raw: ?*anyopaque, event: foundation.sse.Event) void {

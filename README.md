@@ -44,7 +44,7 @@ fund foundation
 ```
 
 `nar.spindle.Host` owns address-stable `std.Io.Threaded`, Spindle Runtime,
-operation registry, and NAR Runtime state. `core.Runtime` borrows its execution
+operation registry, incremental resource coordinator, and NAR Runtime state. `core.Runtime` borrows its execution
 services and must be destroyed first. Call `Host.shutdown(deadline)` to reject
 new work, cancel turns and operations, and request Spindle staged shutdown;
 then call `Host.deinit()`. `deinit` performs an unbounded convergence shutdown
@@ -90,9 +90,15 @@ the registry until observed and released. Late completion after cancellation,
 timeout, release, or owner destruction is rejected, and transferred buffers
 are still consumed exactly once.
 
+Runtime resource operations map their complete key, range, access mode, and
+version constraint to Spindle's incremental scheduler. Conflicting operations
+remain ordered across agents and turns; version mismatch is rejected before
+the operation callback. Minimal builds reject resource-scheduled operations.
+
 ## C ABI
 
-Include `include/nar.h` from C11 or C++. Handles are opaque `uint64_t` values;
+Include `include/nar.h` from C11 or C++. The current breaking ABI version is
+`NAR_API_VERSION == 2`. Handles are opaque `uint64_t` values;
 zero is invalid. Every input structure starts with `struct_size` and
 `api_version`. NAR-owned output uses `nar_buffer`; always call
 `nar_buffer_release`, including for events ignored by the application.
@@ -107,6 +113,12 @@ Destroy agents and unregister tools before runtime destruction when practical.
 waits for in-flight ABI calls, cancels active work, releases callback state,
 and invalidates all child handles.
 
+ABI v2 uses fixed-width lengths and counts. Runtime policy fields form the
+capability ceiling; each agent supplies its own capabilities, and
+`allowed_tools` is an execution ACL rather than prompt-only metadata. Optional
+dispatch and resource-version callbacks borrow their arguments only for the
+callback and must not retain them.
+
 ## Safety Defaults
 
 Tool dispatch validation order is existence, profile, capability/policy, JSON
@@ -114,6 +126,11 @@ Schema, budget, object/revision, resource mapping, then callback. Tool and model
 streams are bounded; terminal mailbox events are not silently dropped. Runtime
 configuration rejects oversized capacities and worker counts before allocation.
 No public API exposes a borrowed world pointer or an executor task address.
+
+The OpenAI-compatible backend parses SSE incrementally. Connect, first-byte,
+and overall deadlines are independent; deltas become pollable before the HTTP
+terminal response, and consumer backpressure aborts with a bounded error rather
+than accumulating an unbounded response body.
 
 Trace files use `NARTRACE`, explicit little-endian fields, versioned records,
 monotonic sequence numbers, lengths, and checksums. Payloads are canonical JSON.

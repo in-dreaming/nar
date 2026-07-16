@@ -1,6 +1,5 @@
 const std = @import("std");
 const nar = @import("nar");
-const spindle = @import("spindle");
 const foundation = @import("foundation");
 const script = @import("script_backend");
 
@@ -18,10 +17,10 @@ fn completeMove(context: *nar.operation.Context) void {
     const payload = foundation.memory.SharedBuffer.initCopy(std.testing.allocator, "{\"moved\":true}", .general) catch return;
     _ = context.complete(payload);
 }
-fn moveAsync(raw: ?*anyopaque, _: nar.tool.InvocationContext) !nar.tool.CallbackResult {
+fn moveAsync(raw: ?*anyopaque, invocation: nar.tool.InvocationContext) !nar.tool.CallbackResult {
     const state: *MoveState = @ptrCast(@alignCast(raw.?));
     state.calls += 1;
-    const id = try state.host.operations().submit(.{ .affinity = .pump }, completeMove);
+    const id = try state.host.operations().submit(.{ .affinity = .pump, .resources = invocation.descriptor.resources }, completeMove);
     state.operation = id;
     return .{ .pending = id };
 }
@@ -34,7 +33,7 @@ fn world() !nar.context.WorldSnapshot {
     return nar.context.WorldSnapshot.initCopy(std.testing.allocator, nar.WorldRevision.fromInt(9), .{ .nanoseconds = 0 }, &.{});
 }
 fn config() nar.core.AgentConfig {
-    return .{ .provider_id = "example", .definition = .{ .model_id = "script", .system_context = "Move once.", .default_budget = .{ .model_calls = 2, .tool_calls = 1, .output_tokens = 16 } } };
+    return .{ .provider_id = "example", .definition = .{ .model_id = "script", .system_context = "Move once.", .allowed_tools = &.{"move_async"}, .default_budget = .{ .model_calls = 2, .tool_calls = 1, .output_tokens = 16 } } };
 }
 
 test "async move reaches waiting operation, requires pump, and preserves trace order" {
@@ -43,7 +42,7 @@ test "async move reaches waiting operation, requires pump, and preserves trace o
     var backend = script.Backend{ .allocator = std.testing.allocator, .phases = &move_phases };
     try host.runtime().models.register(backend.model());
     var state = MoveState{ .host = &host };
-    _ = try host.runtime().tools.register(.{ .name = "move_async", .input_schema = "{\"type\":\"object\",\"required\":[\"x\"],\"properties\":{\"x\":{\"type\":\"integer\"}}}" }, moveAsync, &state);
+    _ = try host.runtime().tools.register(.{ .name = "move_async", .input_schema = "{\"type\":\"object\",\"required\":[\"x\"],\"properties\":{\"x\":{\"type\":\"integer\"}}}", .resources = &.{.{ .key = .{ .kind = .custom, .name = "player-position" }, .mode = .write }} }, moveAsync, &state);
     const agent = try host.runtime().createAgent(config());
     var snapshot = try world();
     defer snapshot.deinit();
@@ -202,26 +201,39 @@ test "fresh replay reproduces owner cancellation without queued work" {
     try std.testing.expectEqual(@as(usize, 0), replay_host.pump(8, std.time.ns_per_s));
 }
 
-test "spindle resource graph preserves RAW WAR and WAW hazards" {
-    const resource = spindle.resource_graph.ResourceKey.named(.custom, spindle.core.StableId.zero, "player-position");
-    var graph = spindle.resource_graph.ResourceTaskGraph.init(std.testing.allocator);
-    defer graph.deinit();
-    const write_a = try graph.addTask(.{ .name = "write-a" });
-    const read = try graph.addTask(.{ .name = "read" });
-    const write_b = try graph.addTask(.{ .name = "write-b" });
-    try graph.addAccess(write_a, .{ .key = resource, .mode = .write });
-    try graph.addAccess(read, .{ .key = resource, .mode = .read });
-    try graph.addAccess(write_b, .{ .key = resource, .mode = .write });
-    var plan = try graph.compile(std.testing.allocator);
-    defer plan.deinit();
-    var raw = false;
-    var war = false;
-    var waw = false;
-    for (plan.diagnostics) |diagnostic| switch (diagnostic.hazard) {
-        .raw => raw = true,
-        .war => war = true,
-        .waw => waw = true,
-        else => {},
+test "NAR resource coordinator preserves hazards and validates versions before callbacks" {
+    const Probe = struct {
+        value: *u32,
+        digit: u32,
+        fn run(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.value.* = self.value.* * 10 + self.digit;
+        }
+        fn resolve(_: ?*anyopaque, _: nar.tool.ResourceKey) ?nar.resource.ResourceVersion {
+            return .{ .generation = 4, .content_hash = 9 };
+        }
     };
-    try std.testing.expect(raw and war and waw);
+    var host = try nar.spindle.Host.init(std.testing.allocator, .{ .compute_workers = 1, .blocking_workers = 1, .resource_resolver = .{ .resolve = Probe.resolve } });
+    defer host.deinit();
+    const write = [_]nar.tool.ResourceAccess{.{ .key = .{ .kind = .custom, .name = "player-position" }, .mode = .write }};
+    var value: u32 = 0;
+    var first_probe = Probe{ .value = &value, .digit = 1 };
+    var second_probe = Probe{ .value = &value, .digit = 2 };
+    const first = try host.resourceCoordinator().submit(.pump, &write, Probe.run, &first_probe);
+    const second = try host.resourceCoordinator().submit(.pump, &write, Probe.run, &second_probe);
+    try std.testing.expectEqual(nar.resource.State.queued, host.resourceCoordinator().status(first));
+    try std.testing.expectEqual(nar.resource.State.pending, host.resourceCoordinator().status(second));
+    try std.testing.expectEqual(@as(usize, 2), host.runtime().pumpMainThread(8, std.time.ns_per_s));
+    try std.testing.expectEqual(@as(u32, 12), value);
+    try host.resourceCoordinator().release(first);
+    try host.resourceCoordinator().release(second);
+
+    const stale_access = [_]nar.tool.ResourceAccess{.{ .key = .{ .kind = .custom, .name = "player-position" }, .mode = .read, .version = .{ .generation = 5 } }};
+    const stale = try host.resourceCoordinator().submit(.pump, &stale_access, Probe.run, &first_probe);
+    _ = host.runtime().pumpMainThread(1, std.time.ns_per_s);
+    try std.testing.expectEqual(nar.resource.State.failed, host.resourceCoordinator().status(stale));
+    const failure = host.resourceCoordinator().failure(stale) orelse return error.TestExpectedVersionFailure;
+    try std.testing.expectEqualStrings("VersionMismatch", @errorName(failure));
+    try std.testing.expectEqual(@as(u32, 12), value);
+    try host.resourceCoordinator().release(stale);
 }

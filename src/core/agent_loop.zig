@@ -78,11 +78,19 @@ pub const RuntimeConfig = struct {
     max_agents: usize = 16,
     mailbox_capacity: usize = 64,
     services: ExecutionServices = .{},
+    tool_policy: tool.Policy = .{},
+    tool_validator: ?tool.HostValidator = null,
     /// Optional offline decision source. When present, tool calls consume
     /// recorded results and never dispatch registry or executor callbacks.
     replay: ?*trace.ReplaySession = null,
 };
-pub const AgentConfig = struct { provider_id: []const u8, definition: context.AgentDefinition, tool_error_policy: ToolErrorPolicy = .return_to_model, max_repeated_tool_calls: usize = 2 };
+pub const AgentConfig = struct {
+    provider_id: []const u8,
+    definition: context.AgentDefinition,
+    capabilities: tool.CapabilitySet = .{ .bits = 0 },
+    tool_error_policy: ToolErrorPolicy = .return_to_model,
+    max_repeated_tool_calls: usize = 2,
+};
 pub const SubmitRequest = struct { input: []const u8, world: *const context.WorldSnapshot };
 
 /// Owner of non-owning model/tool registrations and all created agents.
@@ -147,6 +155,7 @@ pub const Agent = struct {
     next_turn: u64 = 1,
     turn: ?Turn = null,
     trace_writer: ?*trace.Writer = null,
+    trace_error: ?domain.ErrorCode = null,
     fn init(runtime: *Runtime, config: AgentConfig) !Agent {
         if (config.provider_id.len == 0 or config.definition.model_id.len == 0 or config.max_repeated_tool_calls == 0) return error.InvalidArgument;
         return .{ .runtime = runtime, .config = config, .session = context.MemorySession.init(runtime.allocator), .mailbox = try domain.EventMailbox.init(runtime.allocator, runtime.config.mailbox_capacity) };
@@ -204,12 +213,17 @@ pub const Agent = struct {
             return .terminal;
         };
         defer snapshot.deinit();
-        var built = (context.ContextBuilder{ .allocator = self.runtime.allocator, .definition = self.config.definition }).build(.{ .world = &turn.world, .session = &snapshot, .current_input = turn.input, .current_tool_result = turn.tool_result, .budget = &turn.budget }) catch |err| {
+        var descriptors = self.runtime.tools.snapshotDescriptors(self.runtime.allocator) catch {
+            self.finish(.failed, .budget_exceeded, null);
+            return .terminal;
+        };
+        defer descriptors.deinit();
+        var built = (context.ContextBuilder{ .allocator = self.runtime.allocator, .definition = self.config.definition, .resolver_capabilities = self.config.capabilities, .shipping = self.runtime.config.tool_policy.shipping, .runtime_profile = @import("nar_build_options").runtime }).build(.{ .world = &turn.world, .session = &snapshot, .current_input = turn.input, .current_tool_result = turn.tool_result, .descriptors = descriptors.items, .budget = &turn.budget }) catch |err| {
             self.finishError(err);
             return .terminal;
         };
         defer built.deinit();
-        self.writeContextManifest(&built.manifest);
+        if (!self.writeContextManifest(&built.manifest)) return self.finishTraceFailure();
         turn.budget.charge(.model_calls, 1) catch |err| {
             self.finishError(err);
             return .terminal;
@@ -226,10 +240,11 @@ pub const Agent = struct {
         if (turn.tool_result) |value| self.runtime.allocator.free(value);
         turn.tool_result = null;
         self.state = .waiting_model;
-        self.writeModelRequest(built.request());
+        if (!self.writeModelRequest(built.request())) return self.finishTraceFailure();
         return .progressed;
     }
     fn modelEvent(self: *Agent, turn: *Turn) TickResult {
+        if (!self.mailbox.canAccept()) return .would_block;
         const request = &(turn.request orelse {
             self.finish(.failed, .internal_error, null);
             return .terminal;
@@ -239,7 +254,7 @@ pub const Agent = struct {
             return .terminal;
         } orelse return .would_block;
         defer event.deinit();
-        self.writeModelEvent(event);
+        if (!self.writeModelEvent(event)) return self.finishTraceFailure();
         switch (event) {
             .start => return .progressed,
             .text_delta => |buffer| {
@@ -340,11 +355,8 @@ pub const Agent = struct {
                 return .terminal;
             };
         }
-        turn.budget.charge(.tool_calls, 1) catch |err| {
-            self.finishError(err);
-            return .terminal;
-        };
         if (self.runtime.config.replay) |replay| {
+            if (!allowedTool(self.config.definition.allowed_tools, call.name)) return self.toolFailure(turn, .tool_permission_denied);
             turn.tool_result = replay.toolResult(self.runtime.allocator, call.name, call.arguments.items) catch {
                 self.finish(.failed, .model_protocol_error, null);
                 return .terminal;
@@ -357,9 +369,12 @@ pub const Agent = struct {
             return .progressed;
         }
         const handle = self.runtime.tools.handleForName(call.name) orelse return self.toolFailure(turn, .tool_not_found);
-        if (self.trace_writer) |writer| writer.appendToolCall(call.name, call.arguments.items, .hash) catch {};
-        var dispatcher = tool.Dispatcher{ .registry = &self.runtime.tools };
-        var result = dispatcher.dispatch(.{ .tool = handle, .arguments_json = call.arguments.items });
+        if (!allowedTool(self.config.definition.allowed_tools, call.name)) return self.toolFailure(turn, .tool_permission_denied);
+        if (!self.writeToolCall(call.name, call.arguments.items)) return self.finishTraceFailure();
+        var policy = self.runtime.config.tool_policy;
+        policy.agent_policy = self.config.capabilities;
+        var dispatcher = tool.Dispatcher{ .registry = &self.runtime.tools, .policy = policy, .host_validator = self.runtime.config.tool_validator };
+        var result = dispatcher.dispatch(.{ .tool = handle, .arguments_json = call.arguments.items, .world_revision = turn.world.revision, .budget = .{ .context = &turn.budget, .charge = chargeToolBudget } });
         defer result.deinit();
         switch (result) {
             .completed => |buffer| {
@@ -373,13 +388,13 @@ pub const Agent = struct {
                     return .terminal;
                 };
                 self.state = .building_context;
-                self.writeTrace(.tool_result, bytes);
+                if (!self.writeTrace(.tool_result, bytes)) return self.finishTraceFailure();
                 return .progressed;
             },
             .pending => |operation| {
                 turn.operation = operation;
                 self.state = .waiting_operation;
-                self.writeTrace(.operation_transition, "{\"state\":\"queued\"}");
+                if (!self.writeTrace(.operation_transition, "{\"state\":\"queued\"}")) return self.finishTraceFailure();
                 return .progressed;
             },
             .failure => |code| return self.toolFailure(turn, code),
@@ -407,8 +422,7 @@ pub const Agent = struct {
                     return .terminal;
                 };
                 self.state = .building_context;
-                self.writeTrace(.tool_result, bytes);
-                self.writeTrace(.operation_transition, "{\"state\":\"completed\"}");
+                if (!self.writeTrace(.tool_result, bytes) or !self.writeTrace(.operation_transition, "{\"state\":\"completed\"}")) return self.finishTraceFailure();
                 return .progressed;
             },
             .failed => |code| return self.operationFailure(turn, operation, code),
@@ -420,7 +434,7 @@ pub const Agent = struct {
     fn operationFailure(self: *Agent, turn: *Turn, operation: domain.OperationId, code: domain.ErrorCode) TickResult {
         self.runtime.config.services.operations.release(operation);
         turn.operation = null;
-        self.writeTrace(.operation_transition, "{\"state\":\"failed\"}");
+        if (!self.writeTrace(.operation_transition, "{\"state\":\"failed\"}")) return self.finishTraceFailure();
         return self.toolFailure(turn, code);
     }
     fn toolFailure(self: *Agent, turn: *Turn, code: domain.ErrorCode) TickResult {
@@ -461,11 +475,17 @@ pub const Agent = struct {
             self.runtime.config.services.operations.release(operation);
             turn.operation = null;
         }
-        self.state = state;
-        var event = if (state == .completed) domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .priority = .high, .payload = .{ .final_response = foundation.memory.SharedBuffer.initCopy(self.runtime.allocator, turn.output.items, .general) catch return } } else domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .priority = .high, .payload = if (state == .cancelled) .{ .cancelled = reason orelse .requested } else .{ .failed = code } };
-        self.mailbox.post(event) catch event.deinit();
-        if (state == .completed) _ = self.session.append(.turn_outcome, .assistant, turn.output.items) catch {};
-        self.writeTrace(.terminal, switch (state) {
+        var actual_state = state;
+        var actual_code = code;
+        var final_buffer: ?foundation.memory.SharedBuffer = null;
+        if (actual_state == .completed) {
+            final_buffer = foundation.memory.SharedBuffer.initCopy(self.runtime.allocator, turn.output.items, .general) catch null;
+            if (final_buffer == null) {
+                actual_state = .failed;
+                actual_code = .budget_exceeded;
+            }
+        }
+        if (!self.writeTrace(.terminal, switch (actual_state) {
             .completed => "{\"reason\":\"completed\"}",
             .cancelled => switch (reason orelse .requested) {
                 .requested => "{\"reason\":\"cancelled_requested\"}",
@@ -474,31 +494,88 @@ pub const Agent = struct {
                 .owner_destroyed => "{\"reason\":\"cancelled_owner_destroyed\"}",
             },
             else => "{\"reason\":\"failed\"}",
-        });
-    }
-    fn writeTrace(self: *Agent, kind: trace.EventType, payload: []const u8) void {
-        if (self.trace_writer) |writer| writer.appendCanonical(kind, payload) catch {};
-    }
-    fn writeModelEvent(self: *Agent, event: model.ModelEvent) void {
-        if (self.trace_writer) |writer| {
-            const payload = trace.modelEventPayload(self.runtime.allocator, event) catch return;
-            defer self.runtime.allocator.free(payload);
-            writer.appendCanonical(.model_event, payload) catch {};
+        })) {
+            if (final_buffer) |*buffer| buffer.release();
+            final_buffer = null;
+            actual_state = .failed;
+            actual_code = self.trace_error orelse .storage_error;
         }
+        var event = domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .priority = .high, .payload = if (final_buffer) |buffer| .{ .final_response = buffer } else if (actual_state == .cancelled) .{ .cancelled = reason orelse .requested } else .{ .failed = actual_code } };
+        self.mailbox.post(event) catch {
+            event.deinit();
+            actual_state = .failed;
+            actual_code = .internal_error;
+        };
+        self.state = actual_state;
+        if (actual_state == .completed) _ = self.session.append(.turn_outcome, .assistant, turn.output.items) catch {};
     }
-    fn writeModelRequest(self: *Agent, request: model.ModelRequest) void {
-        if (self.trace_writer) |writer| {
-            const payload = trace.modelRequestPayload(self.runtime.allocator, request) catch return;
-            defer self.runtime.allocator.free(payload);
-            writer.appendCanonical(.model_request, payload) catch {};
-        }
+    fn writeTrace(self: *Agent, kind: trace.EventType, payload: []const u8) bool {
+        if (self.trace_writer) |writer| writer.appendCanonical(kind, payload) catch |err| {
+            self.setTraceError(err);
+            return false;
+        };
+        return true;
     }
-    fn writeContextManifest(self: *Agent, manifest: *const context.ContextManifest) void {
+    fn writeToolCall(self: *Agent, name: []const u8, arguments: []const u8) bool {
+        if (self.trace_writer) |writer| writer.appendToolCall(name, arguments, .hash) catch |err| {
+            self.setTraceError(err);
+            return false;
+        };
+        return true;
+    }
+    fn writeModelEvent(self: *Agent, event: model.ModelEvent) bool {
         if (self.trace_writer) |writer| {
-            const payload = std.fmt.allocPrint(self.runtime.allocator, "{{\"items\":{d}}}", .{manifest.items.len}) catch return;
+            const payload = trace.modelEventPayload(self.runtime.allocator, event) catch |err| {
+                self.setTraceError(err);
+                return false;
+            };
             defer self.runtime.allocator.free(payload);
-            writer.appendCanonical(.context_manifest, payload) catch {};
+            writer.appendCanonical(.model_event, payload) catch |err| {
+                self.setTraceError(err);
+                return false;
+            };
         }
+        return true;
+    }
+    fn writeModelRequest(self: *Agent, request: model.ModelRequest) bool {
+        if (self.trace_writer) |writer| {
+            const payload = trace.modelRequestPayload(self.runtime.allocator, request) catch |err| {
+                self.setTraceError(err);
+                return false;
+            };
+            defer self.runtime.allocator.free(payload);
+            writer.appendCanonical(.model_request, payload) catch |err| {
+                self.setTraceError(err);
+                return false;
+            };
+        }
+        return true;
+    }
+    fn writeContextManifest(self: *Agent, manifest: *const context.ContextManifest) bool {
+        if (self.trace_writer) |writer| {
+            const payload = std.fmt.allocPrint(self.runtime.allocator, "{{\"items\":{d}}}", .{manifest.items.len}) catch |err| {
+                self.setTraceError(err);
+                return false;
+            };
+            defer self.runtime.allocator.free(payload);
+            writer.appendCanonical(.context_manifest, payload) catch |err| {
+                self.setTraceError(err);
+                return false;
+            };
+        }
+        return true;
+    }
+    fn setTraceError(self: *Agent, err: anyerror) void {
+        self.trace_error = switch (err) {
+            error.BudgetExceeded, error.OutOfMemory => .budget_exceeded,
+            error.StorageError => .storage_error,
+            else => .internal_error,
+        };
+        self.trace_writer = null;
+    }
+    fn finishTraceFailure(self: *Agent) TickResult {
+        self.finish(.failed, self.trace_error orelse .storage_error, null);
+        return .terminal;
     }
 };
 
@@ -545,6 +622,14 @@ const Turn = struct {
 };
 fn terminal(state: TurnState) bool {
     return state == .completed or state == .failed or state == .cancelled;
+}
+fn allowedTool(names: []const []const u8, name: []const u8) bool {
+    for (names) |allowed| if (std.mem.eql(u8, allowed, name)) return true;
+    return false;
+}
+fn chargeToolBudget(raw: *anyopaque) domain.Error!void {
+    const budget: *context.TurnBudget = @ptrCast(@alignCast(raw));
+    try budget.charge(.tool_calls, 1);
 }
 fn systemNow(_: ?*anyopaque) u64 {
     var clock = foundation.time.SystemClock{};

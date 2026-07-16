@@ -28,8 +28,23 @@ pub const ThreadAffinity = enum { any, main, worker };
 pub const RevisionPolicy = enum { none, exact };
 pub const ProfileMask = packed struct(u2) { minimal: bool = true, runtime: bool = true };
 pub const ToolFlags = packed struct(u8) { debug_only: bool = false, deterministic: bool = false, _reserved: u6 = 0 };
-pub const ResourceAccessMode = enum { read, write };
-pub const ResourceAccess = struct { key: u64, mode: ResourceAccessMode };
+pub const ResourceKind = enum(u8) { file, page, memory_buffer, database_segment, gpu_buffer, texture, network_blob, custom };
+pub const ResourceAccessMode = enum(u8) { read, write, create, delete };
+pub const ResourceRange = union(enum) { whole, page: u64, byte: struct { start: u64, end: u64 } };
+pub const VersionConstraint = union(enum) { any, must_not_exist, exact: u64, generation: u64 };
+pub const ResourceKey = struct {
+    kind: ResourceKind,
+    namespace_high: u64 = 0,
+    namespace_low: u64 = 0,
+    name: []const u8,
+    page: ?u64 = null,
+};
+pub const ResourceAccess = struct {
+    key: ResourceKey,
+    range: ResourceRange = .whole,
+    mode: ResourceAccessMode,
+    version: VersionConstraint = .any,
+};
 
 /// Immutable tool metadata borrowed only during `Registry.register`.
 pub const ToolDescriptor = struct {
@@ -44,6 +59,23 @@ pub const ToolDescriptor = struct {
     resources: []const ResourceAccess = &.{},
     revision_policy: RevisionPolicy = .none,
     profiles: ProfileMask = .{},
+};
+pub const DescriptorSnapshot = struct {
+    allocator: std.mem.Allocator,
+    items: []ToolDescriptor,
+    pub fn deinit(self: *DescriptorSnapshot) void {
+        for (self.items) |descriptor| {
+            self.allocator.free(@constCast(descriptor.name));
+            self.allocator.free(@constCast(descriptor.description));
+            self.allocator.free(@constCast(descriptor.version));
+            self.allocator.free(@constCast(descriptor.input_schema));
+            if (descriptor.output_schema) |schema| self.allocator.free(@constCast(schema));
+            for (descriptor.resources) |resource| self.allocator.free(@constCast(resource.key.name));
+            self.allocator.free(@constCast(descriptor.resources));
+        }
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
 };
 
 /// A generation-checked registration identity. It is invalid after unregister.
@@ -71,7 +103,11 @@ pub const Policy = struct {
 
 pub const HostValidator = struct {
     context: ?*anyopaque = null,
-    validate: *const fn (context: ?*anyopaque, descriptor: ToolDescriptor, target: ?domain.ObjectRef, world_revision: domain.WorldRevision) domain.Error!void,
+    validate: *const fn (context: ?*anyopaque, descriptor: ToolDescriptor, arguments: *const std.json.Value, target: ?domain.ObjectRef, world_revision: domain.WorldRevision) domain.Error!void,
+};
+pub const BudgetCharger = struct {
+    context: *anyopaque,
+    charge: *const fn (*anyopaque) domain.Error!void,
 };
 
 pub const InvocationContext = struct {
@@ -115,6 +151,7 @@ const Entry = struct {
         self.allocator.free(self.descriptor.version);
         self.allocator.free(self.descriptor.input_schema);
         if (self.descriptor.output_schema) |schema| self.allocator.free(schema);
+        for (self.descriptor.resources) |resource| self.allocator.free(resource.key.name);
         self.allocator.free(self.descriptor.resources);
         self.allocator.destroy(self);
     }
@@ -189,6 +226,34 @@ pub const Registry = struct {
         defer entry.release();
         return entry.callback_context;
     }
+    /// Returns an owned, stable metadata snapshot for context construction.
+    pub fn snapshotDescriptors(self: *Registry, allocator: std.mem.Allocator) !DescriptorSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        for (self.slots.items) |slot| if (slot.entry != null) {
+            count += 1;
+        };
+        const items = try allocator.alloc(ToolDescriptor, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |descriptor| {
+                allocator.free(@constCast(descriptor.name));
+                allocator.free(@constCast(descriptor.description));
+                allocator.free(@constCast(descriptor.version));
+                allocator.free(@constCast(descriptor.input_schema));
+                if (descriptor.output_schema) |schema| allocator.free(@constCast(schema));
+                for (descriptor.resources) |resource| allocator.free(@constCast(resource.key.name));
+                allocator.free(@constCast(descriptor.resources));
+            }
+            allocator.free(items);
+        }
+        for (self.slots.items) |slot| if (slot.entry) |entry| {
+            items[initialized] = try cloneDescriptor(allocator, entry.descriptor);
+            initialized += 1;
+        };
+        return .{ .allocator = allocator, .items = items };
+    }
 
     fn acquire(self: *Registry, handle: ToolHandle) ?*Entry {
         self.mutex.lock();
@@ -209,6 +274,31 @@ pub const Registry = struct {
     }
 };
 
+fn cloneDescriptor(allocator: std.mem.Allocator, source: ToolDescriptor) !ToolDescriptor {
+    const name = try allocator.dupe(u8, source.name);
+    errdefer allocator.free(name);
+    const description = try allocator.dupe(u8, source.description);
+    errdefer allocator.free(description);
+    const version = try allocator.dupe(u8, source.version);
+    errdefer allocator.free(version);
+    const input = try allocator.dupe(u8, source.input_schema);
+    errdefer allocator.free(input);
+    const output = if (source.output_schema) |schema| try allocator.dupe(u8, schema) else null;
+    errdefer if (output) |schema| allocator.free(schema);
+    const resources = try allocator.alloc(ResourceAccess, source.resources.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (resources[0..initialized]) |resource| allocator.free(@constCast(resource.key.name));
+        allocator.free(resources);
+    }
+    for (source.resources, 0..) |resource, index| {
+        resources[index] = resource;
+        resources[index].key.name = try allocator.dupe(u8, resource.key.name);
+        initialized += 1;
+    }
+    return .{ .name = name, .description = description, .version = version, .input_schema = input, .output_schema = output, .flags = source.flags, .thread_affinity = source.thread_affinity, .required_capabilities = source.required_capabilities, .resources = resources, .revision_policy = source.revision_policy, .profiles = source.profiles };
+}
+
 pub const DispatchRequest = struct {
     tool: ToolHandle,
     arguments_json: []const u8,
@@ -217,6 +307,7 @@ pub const DispatchRequest = struct {
     cancellation: ?*const domain.CancellationToken = null,
     allocation_budget: ?*foundation.memory.AllocationBudget = null,
     caller_affinity: ThreadAffinity = .any,
+    budget: ?BudgetCharger = null,
 };
 pub const DispatchResult = union(enum) {
     completed: foundation.memory.SharedBuffer,
@@ -242,7 +333,6 @@ pub const Dispatcher = struct {
         if (!self.policy.effective().contains(entry.descriptor.required_capabilities)) return .{ .failure = .tool_permission_denied };
         if (entry.descriptor.thread_affinity != .any and entry.descriptor.thread_affinity != request.caller_affinity) return .{ .failure = .invalid_state };
         if (request.cancellation) |token| if (token.isCancelled()) return .{ .failure = .cancelled };
-        if (entry.descriptor.revision_policy == .exact and !request.world_revision.isValid()) return .{ .failure = .stale_world_revision };
         var document = json.parse(self.registry.allocator, request.arguments_json, self.json_limits) catch |err| return .{ .failure = parseError(err) };
         defer document.deinit();
         if (entry.input_schema.validate(self.registry.allocator, document.root()) catch return .{ .failure = .budget_exceeded }) |failure| {
@@ -250,7 +340,9 @@ pub const Dispatcher = struct {
             owned.deinit(self.registry.allocator);
             return .{ .failure = .tool_schema_error };
         }
-        if (self.host_validator) |host| host.validate(host.context, entry.descriptor, request.target, request.world_revision) catch |err| return .{ .failure = domain.errorCodeFromZig(err) };
+        if (request.budget) |budget| budget.charge(budget.context) catch |err| return .{ .failure = domain.errorCodeFromZig(err) };
+        if (entry.descriptor.revision_policy == .exact and !request.world_revision.isValid()) return .{ .failure = .stale_world_revision };
+        if (self.host_validator) |host| host.validate(host.context, entry.descriptor, document.root(), request.target, request.world_revision) catch |err| return .{ .failure = domain.errorCodeFromZig(err) };
         const invocation = InvocationContext{ .allocator = self.registry.allocator, .descriptor = entry.descriptor, .arguments = document.root(), .target = request.target, .world_revision = request.world_revision, .cancellation = request.cancellation, .allocation_budget = request.allocation_budget };
         var result = entry.callback(entry.callback_context, invocation) catch |err| return .{ .failure = domain.errorCodeFromZig(err) };
         switch (result) {
@@ -274,7 +366,15 @@ pub const Dispatcher = struct {
 
 fn validateDescriptor(descriptor: ToolDescriptor) !void {
     if (descriptor.name.len == 0 or descriptor.version.len == 0 or !asciiIdentifier(descriptor.name) or !asciiVersion(descriptor.version)) return error.InvalidArgument;
-    for (descriptor.resources) |resource| if (resource.key == 0) return error.InvalidArgument;
+    for (descriptor.resources) |resource| {
+        if (resource.key.name.len == 0) return error.InvalidArgument;
+        switch (resource.range) {
+            .byte => |range| if (range.start >= range.end) return error.InvalidArgument,
+            else => {},
+        }
+        if (resource.mode == .create and resource.version != .must_not_exist) return error.InvalidArgument;
+        if (resource.mode != .create and resource.version == .must_not_exist) return error.InvalidArgument;
+    }
 }
 fn makeEntry(allocator: std.mem.Allocator, source: ToolDescriptor, callback: ToolCallback, context: ?*anyopaque) !*Entry {
     const input_schema = try json.compile(allocator, source.input_schema);
@@ -299,8 +399,17 @@ fn makeEntry(allocator: std.mem.Allocator, source: ToolDescriptor, callback: Too
     errdefer allocator.free(input);
     const output = if (source.output_schema) |value| try allocator.dupe(u8, value) else null;
     errdefer if (output) |value| allocator.free(value);
-    const resources = try allocator.dupe(ResourceAccess, source.resources);
-    errdefer allocator.free(resources);
+    const resources = try allocator.alloc(ResourceAccess, source.resources.len);
+    var resources_initialized: usize = 0;
+    errdefer {
+        for (resources[0..resources_initialized]) |resource| allocator.free(resource.key.name);
+        allocator.free(resources);
+    }
+    for (source.resources, 0..) |resource, index| {
+        resources[index] = resource;
+        resources[index].key.name = try allocator.dupe(u8, resource.key.name);
+        resources_initialized += 1;
+    }
     entry.* = .{ .allocator = allocator, .handle = .{}, .descriptor = .{ .name = name, .description = description, .version = version, .input_schema = input, .output_schema = output, .flags = source.flags, .thread_affinity = source.thread_affinity, .required_capabilities = source.required_capabilities, .resources = resources, .revision_policy = source.revision_policy, .profiles = source.profiles }, .input_schema = input_schema, .output_schema = output_schema, .callback = callback, .callback_context = context };
     return entry;
 }

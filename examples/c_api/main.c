@@ -37,7 +37,7 @@ int main(void) {
     nar_tool_handle tool = 0;
     if (nar_tool_register(runtime, &descriptor, confirm_on_main, NULL, &tool) != NAR_OK) return 2;
 
-    size_t completed = 0;
+    uint64_t completed = 0;
     if (nar_runtime_pump_main_thread(runtime, 4, 1000000, &completed) != NAR_OK) return 3;
     if (nar_tool_unregister(runtime, tool) != NAR_OK) return 4;
     if (nar_runtime_shutdown(runtime, 0) != NAR_OK) return 5;

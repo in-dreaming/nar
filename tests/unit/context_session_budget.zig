@@ -51,7 +51,7 @@ test "context preserves mandatory safety and tool results while trimming history
 }
 test "tool resolver is stable and does not disclose unauthorized descriptors" {
     const descriptors = [_]tool.ToolDescriptor{ .{ .name = "z", .input_schema = "{}", .required_capabilities = .{ .bits = 1 } }, .{ .name = "a", .input_schema = "{}" }, .{ .name = "debug", .input_schema = "{}", .flags = .{ .debug_only = true } } };
-    var resolved = try (context.ToolResolver{ .capabilities = .{ .bits = 0 }, .shipping = true }).resolve(std.testing.allocator, &descriptors);
+    var resolved = try (context.ToolResolver{ .allowed_names = &.{ "z", "a", "debug" }, .capabilities = .{ .bits = 0 }, .shipping = true }).resolve(std.testing.allocator, &descriptors);
     defer resolved.deinit();
     try std.testing.expectEqual(@as(usize, 1), resolved.schemas.len);
     try std.testing.expectEqualStrings("a", resolved.schemas[0].name);

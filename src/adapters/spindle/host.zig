@@ -3,6 +3,11 @@ const std = @import("std");
 const spindle = @import("spindle");
 const core = @import("../../core/agent_loop.zig");
 const operation = @import("../../runtime/operation.zig");
+const build_options = @import("nar_build_options");
+const resource_adapter = if (build_options.runtime) @import("resource.zig") else struct {
+    pub const Coordinator = void;
+    pub const VersionResolver = struct {};
+};
 
 pub const Config = struct {
     compute_workers: usize = 1,
@@ -11,6 +16,7 @@ pub const Config = struct {
     operation_capacity: usize = 64,
     observability_capacity: usize = 128,
     fault: spindle.runtime.Fault = .none,
+    resource_resolver: ?resource_adapter.VersionResolver = null,
 };
 
 /// Production owner. `runtime()` is invalid after `deinit`; the returned core
@@ -22,6 +28,7 @@ pub const Host = struct {
         allocator: std.mem.Allocator,
         threaded: std.Io.Threaded,
         spindle_runtime: spindle.runtime.Runtime,
+        resources: resource_adapter.Coordinator,
         operations: operation.Registry,
         nar_runtime: core.Runtime,
     };
@@ -42,7 +49,12 @@ pub const Host = struct {
             .fault = config.fault,
         });
         errdefer state.spindle_runtime.deinit();
-        state.operations = try operation.Registry.init(allocator, .{ .capacity = config.operation_capacity }, state.spindle_runtime.computeExecutor(), state.spindle_runtime.blockingExecutor(), state.spindle_runtime.pumpExecutor());
+        if (comptime build_options.runtime) {
+            state.resources = resource_adapter.Coordinator.init(allocator, state.spindle_runtime.computeExecutor(), state.spindle_runtime.blockingExecutor(), state.spindle_runtime.pumpExecutor(), config.resource_resolver);
+            state.resources.bindResolver();
+        } else state.resources = {};
+        errdefer if (comptime build_options.runtime) state.resources.deinit();
+        state.operations = try operation.Registry.init(allocator, .{ .capacity = config.operation_capacity, .resource_coordinator = if (comptime build_options.runtime) &state.resources else null }, state.spindle_runtime.computeExecutor(), state.spindle_runtime.blockingExecutor(), state.spindle_runtime.pumpExecutor());
         errdefer state.operations.deinit();
         state.nar_runtime = try core.Runtime.init(allocator, .{ .services = servicesFor(&state.spindle_runtime, state.threaded.io(), state.operations.services()) });
         return .{ .state = state };
@@ -64,11 +76,21 @@ pub const Host = struct {
     pub fn operations(self: *Host) *operation.Registry {
         return &self.state.operations;
     }
+    pub fn resourceCoordinator(self: *Host) *resource_adapter.Coordinator {
+        return &self.state.resources;
+    }
+    pub fn setResourceResolver(self: *Host, resolver: ?resource_adapter.VersionResolver) void {
+        if (comptime build_options.runtime) {
+            self.state.resources.resolver = resolver;
+            self.state.resources.bindResolver();
+        }
+    }
 
     /// Cancels NAR turns before requesting Spindle's staged shutdown.
     pub fn shutdown(self: *Host, deadline_monotonic_ns: ?u64) spindle.runtime.ShutdownReport {
         self.state.nar_runtime.shutdown();
         self.state.operations.shutdown();
+        if (comptime build_options.runtime) self.state.resources.shutdown();
         return self.state.spindle_runtime.shutdown(deadline_monotonic_ns);
     }
 
@@ -77,8 +99,9 @@ pub const Host = struct {
         const state = self.state;
         _ = self.shutdown(null);
         state.nar_runtime.deinit();
-        state.spindle_runtime.deinit();
         state.operations.deinit();
+        if (comptime build_options.runtime) state.resources.deinit();
+        state.spindle_runtime.deinit();
         state.threaded.deinit();
         state.allocator.destroy(state);
         self.* = undefined;
@@ -98,6 +121,7 @@ pub const TestHost = struct {
         pump_executor: spindle.executor.PumpExecutor,
         event_storage: [32]spindle.observability.event.Event = undefined,
         event_ring: spindle.observability.event.RingSink,
+        resources: resource_adapter.Coordinator,
         operations: operation.Registry,
         nar_runtime: core.Runtime,
     };
@@ -118,7 +142,12 @@ pub const TestHost = struct {
         state.pump_executor = try spindle.executor.PumpExecutor.init(allocator, queue_capacity);
         errdefer state.pump_executor.deinit();
         state.event_ring = spindle.observability.event.RingSink.init(&state.event_storage);
-        state.operations = try operation.Registry.init(allocator, .{ .capacity = operation_capacity }, state.compute.executor(), state.blocking.executor(), state.pump_executor.executor());
+        if (comptime build_options.runtime) {
+            state.resources = resource_adapter.Coordinator.init(allocator, state.compute.executor(), state.blocking.executor(), state.pump_executor.executor(), null);
+            state.resources.bindResolver();
+        } else state.resources = {};
+        errdefer if (comptime build_options.runtime) state.resources.deinit();
+        state.operations = try operation.Registry.init(allocator, .{ .capacity = operation_capacity, .resource_coordinator = if (comptime build_options.runtime) &state.resources else null }, state.compute.executor(), state.blocking.executor(), state.pump_executor.executor());
         errdefer state.operations.deinit();
         state.nar_runtime = try core.Runtime.init(allocator, .{ .services = servicesForState(state) });
         return .{ .state = state };
@@ -144,6 +173,9 @@ pub const TestHost = struct {
     pub fn operations(self: *TestHost) *operation.Registry {
         return &self.state.operations;
     }
+    pub fn resourceCoordinator(self: *TestHost) *resource_adapter.Coordinator {
+        return &self.state.resources;
+    }
     /// Drains deterministic compute work on the caller thread.
     pub fn runCompute(self: *TestHost) !void {
         try self.state.compute.run();
@@ -160,6 +192,7 @@ pub const TestHost = struct {
         state.pump_executor.deinit();
         state.compute.deinit();
         state.operations.deinit();
+        if (comptime build_options.runtime) state.resources.deinit();
         state.allocator.destroy(state);
         self.* = undefined;
     }

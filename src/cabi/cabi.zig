@@ -8,20 +8,24 @@ const context = nar.context;
 const operation = nar.operation;
 const trace = nar.trace;
 
-const Slice = extern struct { data: ?[*]const u8, size: usize };
-const RuntimeConfig = extern struct { struct_size: u32, api_version: u32, profile: u32, reserved0: u32, max_agents: u64, mailbox_capacity: u64, operation_capacity: u64, compute_workers: u64, blocking_workers: u64, queue_capacity: u64, observability_capacity: u64 };
-const ResourceAccess = extern struct { key: u64, mode: u32, reserved: u32 };
-const ToolDescriptor = extern struct { struct_size: u32, api_version: u32, name: Slice, description: Slice, version: Slice, input_schema: Slice, output_schema: Slice, required_capabilities: u64, resources: ?[*]const ResourceAccess, resource_count: usize, thread_affinity: u32, flags: u32, profile_mask: u32, revision_policy: u32 };
+const Slice = extern struct { data: ?[*]const u8, size: u64 };
+const ValidateDispatchFn = *const fn (Slice, Slice, u64, ?*anyopaque) callconv(.c) u32;
+const ResourceKey = extern struct { kind: u32, reserved: u32, namespace_high: u64, namespace_low: u64, name: Slice, page: u64 };
+const ResourceVersion = extern struct { generation: u64, content_hash: u64, exists: u32, has_content_hash: u32 };
+const ResolveResourceFn = *const fn (*const ResourceKey, *ResourceVersion, ?*anyopaque) callconv(.c) u32;
+const RuntimeConfig = extern struct { struct_size: u32, api_version: u32, profile: u32, reserved0: u32, max_agents: u64, mailbox_capacity: u64, operation_capacity: u64, compute_workers: u64, blocking_workers: u64, queue_capacity: u64, observability_capacity: u64, build_capabilities: u64, shipping_capabilities: u64, project_capabilities: u64, runtime_capabilities: u64, shipping: u32, reserved1: u32, validate_dispatch: ?ValidateDispatchFn, resolve_resource: ?ResolveResourceFn, host_userdata: ?*anyopaque };
+const ResourceAccess = extern struct { struct_size: u32, api_version: u32, key: ResourceKey, mode: u32, range_kind: u32, version_kind: u32, reserved: u32, range_start: u64, range_end: u64, version_value: u64 };
+const ToolDescriptor = extern struct { struct_size: u32, api_version: u32, name: Slice, description: Slice, version: Slice, input_schema: Slice, output_schema: Slice, required_capabilities: u64, resources: ?[*]const ResourceAccess, resource_count: u64, thread_affinity: u32, flags: u32, profile_mask: u32, revision_policy: u32 };
 const Budget = extern struct { wall_time_ns: u64, model_calls: u64, tool_calls: u64, context_tokens: u64, output_tokens: u64, cost_micros: u64, trace_bytes: u64 };
-const AgentConfig = extern struct { struct_size: u32, api_version: u32, provider_id: Slice, model_id: Slice, system_context: Slice, static_context: Slice, allowed_tools: ?[*]const Slice, allowed_tool_count: usize, budget: Budget, max_repeated_tool_calls: u64, tool_error_policy: u32, reserved: u32 };
+const AgentConfig = extern struct { struct_size: u32, api_version: u32, provider_id: Slice, model_id: Slice, system_context: Slice, static_context: Slice, allowed_tools: ?[*]const Slice, allowed_tool_count: u64, budget: Budget, max_repeated_tool_calls: u64, capabilities: u64, tool_error_policy: u32, reserved: u32 };
 const WorldSection = extern struct { name: Slice, payload: Slice };
-const SubmitRequest = extern struct { struct_size: u32, api_version: u32, input: Slice, world_revision: u64, captured_at_ns: u64, sections: ?[*]const WorldSection, section_count: usize };
+const SubmitRequest = extern struct { struct_size: u32, api_version: u32, input: Slice, world_revision: u64, captured_at_ns: u64, sections: ?[*]const WorldSection, section_count: u64 };
 const Invocation = extern struct { arguments_json: Slice, world_revision: u64, object_id: u64, object_generation: u32, reserved: u32, operation: u64 };
 const ResultSink = extern struct { complete: *const fn (*ResultSink, Slice) callconv(.c) u32, fail: *const fn (*ResultSink, u32) callconv(.c) u32, userdata: ?*anyopaque };
-const Buffer = extern struct { data: ?[*]const u8, size: usize, release: ?*const fn (*Buffer) callconv(.c) void, userdata: ?*anyopaque };
+const Buffer = extern struct { data: ?[*]const u8, size: u64, release: ?*const fn (*Buffer) callconv(.c) void, userdata: ?*anyopaque };
 const Event = extern struct { struct_size: u32, api_version: u32, kind: u32, reserved: u32, sequence: u64, turn: u64, timestamp_ns: u64, operation: u64, err: u32, cancel_reason: u32, buffer: Buffer };
 
-pub const api_version: u32 = 1;
+pub const api_version: u32 = 2;
 const Allocator = std.heap.smp_allocator;
 
 const RuntimeSlot = struct { generation: u32 = 1, state: ?*State = null };
@@ -50,6 +54,9 @@ const State = struct {
     replay_bytes: ?[]u8 = null,
     replay_session: ?trace.ReplaySession = null,
     replay_backend: ?trace.ReplayBackend = null,
+    validate_dispatch: ?ValidateDispatchFn = null,
+    resolve_resource: ?ResolveResourceFn = null,
+    host_userdata: ?*anyopaque = null,
     fn runtime(self: *State) *core.Runtime {
         return switch (self.host) {
             .production => |*v| v.runtime(),
@@ -95,11 +102,12 @@ const State = struct {
 fn code(err: anyerror) u32 {
     return @intFromEnum(nar.domain.errorCodeFromZig(err));
 }
-fn slice(raw: ?[*]const u8, len: usize) ?[]const u8 {
+fn slice(raw: ?[*]const u8, raw_len: u64) ?[]const u8 {
+    const len = std.math.cast(usize, raw_len) orelse return null;
     if (raw == null and len != 0) return null;
     return if (raw) |p| p[0..len] else &.{};
 }
-fn optionalSlice(raw: ?[*]const u8, len: usize) ?[]const u8 {
+fn optionalSlice(raw: ?[*]const u8, len: u64) ?[]const u8 {
     if (raw == null and len == 0) return null;
     return slice(raw, len);
 }
@@ -160,6 +168,7 @@ pub export fn nar_replay_runtime_create(raw: ?*const RuntimeConfig, trace_bytes:
         const replay_session = trace.ReplaySession.init(trace_copy, .semantic) catch null;
         if (replay_session) |session| {
             state.replay_session = session;
+            state.runtime().config.replay = &state.replay_session.?;
         } else {
             state.allocator.free(trace_copy);
             state.replay_bytes = null;
@@ -193,6 +202,7 @@ fn create(raw: ?*const RuntimeConfig, out: ?*u64) u32 {
     const config = raw orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
     if (out == null or !validHeader(config.struct_size, @sizeOf(RuntimeConfig), config.api_version)) return @intFromEnum(nar.ErrorCode.invalid_argument);
     if (config.profile > 1) return @intFromEnum(nar.ErrorCode.invalid_argument);
+    if (config.reserved0 != 0 or config.reserved1 != 0 or config.shipping > 1) return @intFromEnum(nar.ErrorCode.invalid_argument);
     const max_agents = bounded(config.max_agents, 16, 4096) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
     const mailbox_capacity = bounded(config.mailbox_capacity, 64, 1 << 20) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
     const operation_capacity = bounded(config.operation_capacity, 64, 1 << 20) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
@@ -208,6 +218,21 @@ fn create(raw: ?*const RuntimeConfig, out: ?*u64) u32 {
     }
     state.runtime().config.max_agents = max_agents;
     state.runtime().config.mailbox_capacity = mailbox_capacity;
+    state.validate_dispatch = config.validate_dispatch;
+    state.resolve_resource = config.resolve_resource;
+    state.host_userdata = config.host_userdata;
+    if (comptime nar.hasRuntimeSupport()) if (state.resolve_resource != null) switch (state.host) {
+        .production => |*host| host.setResourceResolver(.{ .context = state, .resolve = resolveResource }),
+        .deterministic => {},
+    };
+    state.runtime().config.tool_policy = .{
+        .build_hard_limit = .{ .bits = capabilityDefault(config.build_capabilities) },
+        .shipping_policy = .{ .bits = capabilityDefault(config.shipping_capabilities) },
+        .project_policy = .{ .bits = capabilityDefault(config.project_capabilities) },
+        .runtime_override = .{ .bits = capabilityDefault(config.runtime_capabilities) },
+        .shipping = config.shipping != 0,
+    };
+    if (state.validate_dispatch != null) state.runtime().config.tool_validator = .{ .context = state, .validate = validateDispatch };
     runtime_mutex.lock();
     defer runtime_mutex.unlock();
     var index: usize = 0;
@@ -223,6 +248,28 @@ fn create(raw: ?*const RuntimeConfig, out: ?*u64) u32 {
 fn bounded(value: u64, default: usize, maximum: usize) ?usize {
     const selected = if (value == 0) default else std.math.cast(usize, value) orelse return null;
     return if (selected <= maximum) selected else null;
+}
+fn capabilityDefault(value: u64) u64 {
+    return if (value == 0) std.math.maxInt(u64) else value;
+}
+fn validateDispatch(raw: ?*anyopaque, descriptor: tool.ToolDescriptor, arguments: *const std.json.Value, _: ?nar.ObjectRef, revision: nar.WorldRevision) nar.Error!void {
+    const state: *State = @ptrCast(@alignCast(raw.?));
+    const callback = state.validate_dispatch orelse return;
+    const json = std.json.Stringify.valueAlloc(state.allocator, arguments.*, .{}) catch return error.BudgetExceeded;
+    defer state.allocator.free(json);
+    const result = callback(.{ .data = descriptor.name.ptr, .size = descriptor.name.len }, .{ .data = json.ptr, .size = json.len }, revision.toInt(), state.host_userdata);
+    const stable = errorCode(result) orelse return error.InvalidArgument;
+    if (nar.domain.zigErrorFromCode(stable)) |err| return err;
+}
+const HostResourceVersion = if (nar.hasRuntimeSupport()) nar.resource.ResourceVersion else void;
+fn resolveResource(raw: ?*anyopaque, key: tool.ResourceKey) ?HostResourceVersion {
+    if (comptime !nar.hasRuntimeSupport()) return null;
+    const state: *State = @ptrCast(@alignCast(raw.?));
+    const callback = state.resolve_resource orelse return null;
+    const c_key = ResourceKey{ .kind = @intFromEnum(key.kind), .reserved = 0, .namespace_high = key.namespace_high, .namespace_low = key.namespace_low, .name = .{ .data = key.name.ptr, .size = key.name.len }, .page = key.page orelse 0 };
+    var version = ResourceVersion{ .generation = 0, .content_hash = 0, .exists = 0, .has_content_hash = 0 };
+    if (callback(&c_key, &version, state.host_userdata) != 0 or version.exists == 0) return null;
+    return .{ .generation = version.generation, .content_hash = if (version.has_content_hash != 0) version.content_hash else null, .exists = true };
 }
 pub export fn nar_runtime_shutdown(value: u64, deadline: u64) callconv(.c) u32 {
     const state = acquire(value) orelse return @intFromEnum(nar.ErrorCode.invalid_state);
@@ -282,11 +329,29 @@ pub export fn nar_tool_register(runtime: u64, raw: ?*const ToolDescriptor, callb
     const output_schema = optionalSlice(d.output_schema.data, d.output_schema.size);
     if (d.output_schema.data == null and d.output_schema.size != 0) return @intFromEnum(nar.ErrorCode.invalid_argument);
     const raw_resources = d.resources orelse if (d.resource_count != 0) return @intFromEnum(nar.ErrorCode.invalid_argument) else &[_]ResourceAccess{};
-    const resources = Allocator.alloc(tool.ResourceAccess, d.resource_count) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    const resource_count = std.math.cast(usize, d.resource_count) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const resources = Allocator.alloc(tool.ResourceAccess, resource_count) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
     defer Allocator.free(resources);
-    for (raw_resources[0..d.resource_count], 0..) |resource, index| {
-        if (resource.key == 0 or resource.mode > 1 or resource.reserved != 0) return @intFromEnum(nar.ErrorCode.invalid_argument);
-        resources[index] = .{ .key = resource.key, .mode = if (resource.mode == 0) .read else .write };
+    for (raw_resources[0..resource_count], 0..) |resource, index| {
+        if (!validHeader(resource.struct_size, @sizeOf(ResourceAccess), resource.api_version) or resource.key.kind > 7 or resource.key.reserved != 0 or resource.mode > 3 or resource.range_kind > 2 or resource.version_kind > 3 or resource.reserved != 0) return @intFromEnum(nar.ErrorCode.invalid_argument);
+        const key_name = slice(resource.key.name.data, resource.key.name.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+        resources[index] = .{
+            .key = .{ .kind = @enumFromInt(resource.key.kind), .namespace_high = resource.key.namespace_high, .namespace_low = resource.key.namespace_low, .name = key_name, .page = if (resource.key.kind == 1) resource.key.page else null },
+            .mode = @enumFromInt(resource.mode),
+            .range = switch (resource.range_kind) {
+                0 => .whole,
+                1 => .{ .page = resource.range_start },
+                2 => .{ .byte = .{ .start = resource.range_start, .end = resource.range_end } },
+                else => unreachable,
+            },
+            .version = switch (resource.version_kind) {
+                0 => .any,
+                1 => .must_not_exist,
+                2 => .{ .exact = resource.version_value },
+                3 => .{ .generation = resource.version_value },
+                else => unreachable,
+            },
+        };
     }
     const entry = Allocator.create(CTool) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
     entry.* = .{ .callback = callback.?, .userdata = userdata, .affinity = @enumFromInt(d.thread_affinity), .state = state };
@@ -370,7 +435,7 @@ fn sinkFail(raw: *ResultSink, value: u32) callconv(.c) u32 {
 }
 fn cTool(raw: ?*anyopaque, invocation: tool.InvocationContext) !tool.CallbackResult {
     const value: *CTool = @ptrCast(@alignCast(raw.?));
-    if (value.affinity != .any) {
+    if (value.affinity != .any or invocation.descriptor.resources.len != 0) {
         const args = try std.json.Stringify.valueAlloc(Allocator, invocation.arguments.*, .{});
         const work = Allocator.create(CPumpWork) catch {
             Allocator.free(args);
@@ -378,7 +443,7 @@ fn cTool(raw: ?*anyopaque, invocation: tool.InvocationContext) !tool.CallbackRes
         };
         value.retain();
         work.* = .{ .tool = value, .arguments = args, .world_revision = invocation.world_revision, .target = invocation.target };
-        const id = try value.state.operations().submitOwned(.{ .affinity = if (value.affinity == .main) .pump else .compute }, runCPumpTool, work, deinitCPumpWork);
+        const id = try value.state.operations().submitOwned(.{ .affinity = if (value.affinity == .main) .pump else .compute, .resources = invocation.descriptor.resources }, runCPumpTool, work, deinitCPumpWork);
         return .{ .pending = id };
     }
     return invokeTool(value, invocation, null);
@@ -428,6 +493,7 @@ pub export fn nar_agent_create(runtime: u64, raw: ?*const AgentConfig, out: ?*u6
     const c = raw orelse return 1;
     if (state.runtime().stopped) return 2;
     if (out == null or !validHeader(c.struct_size, @sizeOf(AgentConfig), c.api_version)) return 1;
+    if (c.tool_error_policy > 1 or c.reserved != 0) return 1;
     const agent = Allocator.create(CAgent) catch return 5;
     errdefer Allocator.destroy(agent);
     agent.provider = Allocator.dupe(u8, slice(c.provider_id.data, c.provider_id.size) orelse return 1) catch return 5;
@@ -439,10 +505,19 @@ pub export fn nar_agent_create(runtime: u64, raw: ?*const AgentConfig, out: ?*u6
     agent.static = Allocator.dupe(u8, slice(c.static_context.data, c.static_context.size) orelse return 1) catch return 5;
     errdefer Allocator.free(agent.static);
     const allowed = c.allowed_tools orelse if (c.allowed_tool_count != 0) return 1 else &[_]Slice{};
-    agent.allowed = Allocator.alloc([]const u8, c.allowed_tool_count) catch return 5;
-    errdefer Allocator.free(agent.allowed);
-    for (allowed[0..c.allowed_tool_count], 0..) |name, i| agent.allowed[i] = Allocator.dupe(u8, slice(name.data, name.size) orelse return 1) catch return 5;
-    agent.agent = state.runtime().createAgent(.{ .provider_id = agent.provider, .definition = .{ .model_id = agent.model, .system_context = agent.system, .static_context = agent.static, .allowed_tools = agent.allowed, .default_budget = .{ .wall_time_ns = c.budget.wall_time_ns, .model_calls = c.budget.model_calls, .tool_calls = c.budget.tool_calls, .context_tokens = c.budget.context_tokens, .output_tokens = c.budget.output_tokens, .cost_micros = c.budget.cost_micros, .trace_bytes = c.budget.trace_bytes } }, .max_repeated_tool_calls = @intCast(if (c.max_repeated_tool_calls == 0) 2 else c.max_repeated_tool_calls) }) catch |err| return code(err);
+    const allowed_count = std.math.cast(usize, c.allowed_tool_count) orelse return 1;
+    agent.allowed = Allocator.alloc([]const u8, allowed_count) catch return 5;
+    var allowed_initialized: usize = 0;
+    errdefer {
+        for (agent.allowed[0..allowed_initialized]) |name| Allocator.free(@constCast(name));
+        Allocator.free(agent.allowed);
+    }
+    for (allowed[0..allowed_count], 0..) |name, i| {
+        agent.allowed[i] = Allocator.dupe(u8, slice(name.data, name.size) orelse return 1) catch return 5;
+        allowed_initialized += 1;
+    }
+    agent.agent = state.runtime().createAgent(.{ .provider_id = agent.provider, .definition = .{ .model_id = agent.model, .system_context = agent.system, .static_context = agent.static, .allowed_tools = agent.allowed, .default_budget = .{ .wall_time_ns = c.budget.wall_time_ns, .model_calls = c.budget.model_calls, .tool_calls = c.budget.tool_calls, .context_tokens = c.budget.context_tokens, .output_tokens = c.budget.output_tokens, .cost_micros = c.budget.cost_micros, .trace_bytes = c.budget.trace_bytes } }, .capabilities = .{ .bits = c.capabilities }, .tool_error_policy = @enumFromInt(c.tool_error_policy), .max_repeated_tool_calls = @intCast(if (c.max_repeated_tool_calls == 0) 2 else c.max_repeated_tool_calls) }) catch |err| return code(err);
+    errdefer _ = state.runtime().destroyAgent(agent.agent);
     var index: usize = 0;
     while (index < state.agents.items.len and state.agents.items[index].agent != null) : (index += 1) {}
     if (index == state.agents.items.len) state.agents.append(Allocator, .{}) catch return 5;
@@ -469,9 +544,10 @@ pub export fn nar_agent_submit(runtime: u64, value: u64, raw: ?*const SubmitRequ
     const request = raw orelse return 1;
     if (out == null or !validHeader(request.struct_size, @sizeOf(SubmitRequest), request.api_version)) return 1;
     const sections = request.sections orelse if (request.section_count != 0) return 1 else &[_]WorldSection{};
-    var owned = Allocator.alloc(context.WorldSection, request.section_count) catch return 5;
+    const section_count = std.math.cast(usize, request.section_count) orelse return 1;
+    var owned = Allocator.alloc(context.WorldSection, section_count) catch return 5;
     defer Allocator.free(owned);
-    for (sections[0..request.section_count], 0..) |section, i| owned[i] = .{ .name = slice(section.name.data, section.name.size) orelse return 1, .payload = slice(section.payload.data, section.payload.size) orelse return 1 };
+    for (sections[0..section_count], 0..) |section, i| owned[i] = .{ .name = slice(section.name.data, section.name.size) orelse return 1, .payload = slice(section.payload.data, section.payload.size) orelse return 1 };
     var world = context.WorldSnapshot.initCopy(Allocator, nar.WorldRevision.fromInt(request.world_revision), .{ .nanoseconds = request.captured_at_ns }, owned) catch |err| return code(err);
     defer world.deinit();
     const turn = agent.agent.submit(.{ .input = slice(request.input.data, request.input.size) orelse return 1, .world = &world }) catch |err| return code(err);
@@ -486,10 +562,11 @@ pub export fn nar_agent_tick(runtime: u64, value: u64, out: ?*u32) callconv(.c) 
     out.?.* = @intFromEnum(agent.agent.tick());
     return 0;
 }
-pub export fn nar_runtime_pump_main_thread(runtime: u64, jobs: usize, ns: u64, out: ?*usize) callconv(.c) u32 {
+pub export fn nar_runtime_pump_main_thread(runtime: u64, raw_jobs: u64, ns: u64, out: ?*u64) callconv(.c) u32 {
     const state = acquire(runtime) orelse return 2;
     defer release(state);
     if (out == null) return 1;
+    const jobs = std.math.cast(usize, raw_jobs) orelse return 1;
     out.?.* = state.pump(jobs, ns);
     return 0;
 }

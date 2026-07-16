@@ -4,6 +4,12 @@ const foundation = @import("foundation");
 const spindle = @import("spindle");
 const domain = @import("../foundation/domain.zig");
 const core = @import("../core/agent_loop.zig");
+const tool = @import("../tool/runtime.zig");
+const build_options = @import("nar_build_options");
+const resource_adapter = if (build_options.runtime) @import("../adapters/spindle/resource.zig") else struct {
+    pub const Coordinator = void;
+    pub const Handle = void;
+};
 
 const Mutex = struct {
     state: std.atomic.Mutex = .unlocked,
@@ -17,10 +23,11 @@ const Mutex = struct {
 
 pub const Affinity = enum { compute, blocking, pump };
 pub const State = enum { pending, queued, running, completed, failed, cancelled, timed_out };
-pub const Config = struct { capacity: usize = 64 };
+pub const Config = struct { capacity: usize = 64, resource_coordinator: ?*resource_adapter.Coordinator = null };
 pub const SubmitOptions = struct {
     affinity: Affinity = .compute,
     deadline_monotonic_ns: ?u64 = null,
+    resources: []const tool.ResourceAccess = &.{},
 };
 pub const OperationFn = *const fn (*Context) void;
 pub const ContextDeinitFn = *const fn (std.mem.Allocator, ?*anyopaque) void;
@@ -68,6 +75,7 @@ const Entry = struct {
     callback: OperationFn,
     userdata: ?*anyopaque = null,
     userdata_deinit: ?ContextDeinitFn = null,
+    resource_handle: ?resource_adapter.Handle = null,
 };
 const Slot = struct { generation: u32 = 1, entry: ?*Entry = null };
 
@@ -84,11 +92,12 @@ pub const Registry = struct {
     retired: std.ArrayListUnmanaged(*Entry) = .empty,
     live: usize = 0,
     stopped: bool = false,
+    resource_coordinator: ?*resource_adapter.Coordinator,
     mutex: Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Config, compute: spindle.executor.Executor, blocking: spindle.executor.Executor, pump: spindle.executor.Executor) !Registry {
         if (config.capacity == 0) return error.InvalidArgument;
-        var registry = Registry{ .allocator = allocator, .compute = compute, .blocking = blocking, .pump = pump, .capacity = config.capacity };
+        var registry = Registry{ .allocator = allocator, .compute = compute, .blocking = blocking, .pump = pump, .capacity = config.capacity, .resource_coordinator = config.resource_coordinator };
         try registry.slots.ensureTotalCapacity(allocator, config.capacity);
         errdefer registry.slots.deinit(allocator);
         try registry.retired.ensureTotalCapacity(allocator, config.capacity);
@@ -144,19 +153,35 @@ pub const Registry = struct {
         slot.entry = entry;
         self.live += 1;
         self.mutex.unlock();
-        const executor = switch (options.affinity) {
-            .compute => self.compute,
-            .blocking => self.blocking,
-            .pump => self.pump,
-        };
-        executor.submit(&entry.task, .{}) catch |err| {
-            self.abortSubmission(entry);
-            return switch (err) {
-                error.Backpressure => error.BudgetExceeded,
-                error.Shutdown => error.Shutdown,
-                else => error.InvalidState,
+        if (options.resources.len != 0) {
+            if (comptime !build_options.runtime) {
+                self.abortSubmission(entry);
+                return error.InvalidState;
+            } else {
+                const coordinator = self.resource_coordinator orelse {
+                    self.abortSubmission(entry);
+                    return error.InvalidState;
+                };
+                entry.resource_handle = coordinator.submit(@enumFromInt(@intFromEnum(options.affinity)), options.resources, runResource, entry) catch |err| {
+                    self.abortSubmission(entry);
+                    return err;
+                };
+            }
+        } else {
+            const selected = switch (options.affinity) {
+                .compute => self.compute,
+                .blocking => self.blocking,
+                .pump => self.pump,
             };
-        };
+            selected.submit(&entry.task, .{}) catch |err| {
+                self.abortSubmission(entry);
+                return switch (err) {
+                    error.Backpressure => error.BudgetExceeded,
+                    error.Shutdown => error.Shutdown,
+                    else => error.InvalidState,
+                };
+            };
+        }
         self.mutex.lock();
         if (entry.state == .pending) entry.state = .queued;
         self.mutex.unlock();
@@ -200,6 +225,7 @@ pub const Registry = struct {
         _ = entry.cancel_source.cancel(reason);
         if (!terminal(entry.state)) {
             _ = entry.task.cancel();
+            if (comptime build_options.runtime) if (entry.resource_handle) |handle| self.resource_coordinator.?.cancel(handle);
             self.setTerminalLocked(entry, .cancelled, .{ .cancelled = reason });
         }
         self.mutex.unlock();
@@ -268,6 +294,7 @@ pub const Registry = struct {
         for (self.slots.items) |slot| if (slot.entry) |entry| {
             _ = entry.cancel_source.cancel(.shutdown);
             _ = entry.task.cancel();
+            if (comptime build_options.runtime) if (entry.resource_handle) |handle| self.resource_coordinator.?.cancel(handle);
             if (!terminal(entry.state)) self.setTerminalLocked(entry, .cancelled, .{ .cancelled = .shutdown });
         };
         self.mutex.unlock();
@@ -334,15 +361,38 @@ pub const Registry = struct {
         var index: usize = 0;
         while (index < self.retired.items.len) {
             const entry = self.retired.items[index];
-            const state = entry.task.status();
-            if (entry.task.queue_references.load(.acquire) == 0 and (state == .completed or state == .failed or state == .cancelled)) {
+            const retired = if (comptime build_options.runtime) if (entry.resource_handle) |handle| switch (self.resource_coordinator.?.status(handle)) {
+                .completed, .failed, .cancelled => true,
+                else => false,
+            } else taskRetired(entry) else taskRetired(entry);
+            if (retired) {
                 _ = self.retired.swapRemove(index);
+                if (comptime build_options.runtime) if (entry.resource_handle) |handle| {
+                    self.resource_coordinator.?.release(handle) catch {
+                        index += 1;
+                        continue;
+                    };
+                    entry.resource_handle = null;
+                };
                 self.destroyEntry(entry);
             } else index += 1;
         }
     }
     fn run(task: *spindle.executor.Task) void {
         const entry: *Entry = @ptrCast(@alignCast(task.context.?));
+        entry.registry.mutex.lock();
+        if (terminal(entry.state)) {
+            entry.registry.mutex.unlock();
+            return;
+        }
+        entry.state = .running;
+        entry.registry.mutex.unlock();
+        var context = Context{ .entry = entry };
+        entry.callback(&context);
+        _ = entry.registry.fail(entry, .operation_failed);
+    }
+    fn runResource(raw: ?*anyopaque) !void {
+        const entry: *Entry = @ptrCast(@alignCast(raw.?));
         entry.registry.mutex.lock();
         if (terminal(entry.state)) {
             entry.registry.mutex.unlock();
@@ -364,6 +414,11 @@ pub const Registry = struct {
         (@as(*Registry, @ptrCast(@alignCast(raw.?)))).release(id);
     }
 };
+
+fn taskRetired(entry: *Entry) bool {
+    const state = entry.task.status();
+    return entry.task.queue_references.load(.acquire) == 0 and (state == .completed or state == .failed or state == .cancelled);
+}
 
 fn terminal(state: State) bool {
     return switch (state) {
