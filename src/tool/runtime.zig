@@ -182,6 +182,14 @@ pub const Registry = struct {
         return null;
     }
 
+    /// Returns the callback context for a live handle. This is intended for
+    /// ownership adapters which must release callback state after unregister.
+    pub fn callbackContextFor(self: *Registry, handle: ToolHandle) ?*anyopaque {
+        const entry = self.acquire(handle) orelse return null;
+        defer entry.release();
+        return entry.callback_context;
+    }
+
     fn acquire(self: *Registry, handle: ToolHandle) ?*Entry {
         self.mutex.lock();
         defer self.mutex.unlock();

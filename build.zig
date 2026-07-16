@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) void {
         .root_module = nar,
     });
     b.installArtifact(static_library);
+    const install_header = b.addInstallHeaderFile(b.path("include/nar.h"), "nar.h");
+    b.getInstallStep().dependOn(&install_header.step);
 
     const shared_library = if (profile == .runtime)
         b.addLibrary(.{
@@ -120,7 +122,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     cabi_bootstrap_tests.root_module.addImport("nar", nar);
-    const cabi = b.step("test-cabi", "Run the temporary bootstrap check before the C ABI is introduced");
+    cabi_bootstrap_tests.root_module.addIncludePath(b.path("include"));
+    const cabi = b.step("test-cabi", "Run C ABI ownership and header contract checks");
     cabi.dependOn(&b.addRunArtifact(cabi_bootstrap_tests).step);
 
     const feature_matrix_tests = b.addTest(.{

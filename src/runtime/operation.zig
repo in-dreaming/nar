@@ -181,6 +181,40 @@ pub const Registry = struct {
         }
         self.mutex.unlock();
     }
+    /// Completes a live operation from an embedding callback. Ownership of
+    /// `payload` transfers regardless of whether the completion is accepted.
+    pub fn completeExternal(self: *Registry, id: domain.OperationId, payload: foundation.memory.SharedBuffer) bool {
+        self.mutex.lock();
+        const entry = self.find(id) orelse {
+            self.mutex.unlock();
+            var owned = payload;
+            owned.release();
+            return false;
+        };
+        var owned = payload;
+        if (terminal(entry.state)) {
+            self.mutex.unlock();
+            owned.release();
+            return false;
+        }
+        self.setTerminalLocked(entry, .completed, .{ .completed = owned });
+        self.mutex.unlock();
+        return true;
+    }
+    pub fn failExternal(self: *Registry, id: domain.OperationId, value: domain.ErrorCode) bool {
+        self.mutex.lock();
+        const entry = self.find(id) orelse {
+            self.mutex.unlock();
+            return false;
+        };
+        if (terminal(entry.state)) {
+            self.mutex.unlock();
+            return false;
+        }
+        self.setTerminalLocked(entry, .failed, .{ .failed = value });
+        self.mutex.unlock();
+        return true;
+    }
     pub fn release(self: *Registry, id: domain.OperationId) void {
         self.mutex.lock();
         self.collectRetiredLocked();

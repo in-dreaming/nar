@@ -46,6 +46,9 @@ pub const spindle = @import("adapters/spindle/host.zig");
 /// Host-owned asynchronous operation registry and executor affinity contracts.
 pub const operation = @import("runtime/operation.zig");
 
+/// Stable C11 ABI with owned runtime hosts and generation-checked handles.
+pub const cabi = @import("cabi/cabi.zig");
+
 /// OpenAI-compatible HTTP/SSE model backend. This surface is absent from
 /// minimal builds so they neither compile HTTP code nor require an HTTP host.
 pub const openai = if (build_options.runtime) @import("model/openai.zig") else struct {};
