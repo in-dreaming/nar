@@ -84,6 +84,24 @@ test "mailbox preserves FIFO sequence, merges adjacent deltas, and reports backp
     try std.testing.expect(second.isTerminal());
 }
 
+test "reserved terminal remains ordered before later normal events" {
+    const turn = domain.TurnId.init(1).?;
+    var mailbox = try domain.EventMailbox.init(std.testing.allocator, 1);
+    defer mailbox.deinit();
+    try mailbox.post(try textEvent(turn, "a", .normal));
+    try mailbox.post(.{ .turn_id = turn, .timestamp = .{}, .priority = .critical, .payload = .{ .failed = .timeout } });
+    var first = mailbox.poll().?;
+    defer first.deinit();
+    try mailbox.post(try textEvent(turn, "b", .normal));
+    var terminal = mailbox.poll().?;
+    defer terminal.deinit();
+    var later = mailbox.poll().?;
+    defer later.deinit();
+    try std.testing.expect(first.sequence < terminal.sequence and terminal.sequence < later.sequence);
+    try std.testing.expect(terminal.isTerminal());
+    try std.testing.expect(later.payload == .text_delta);
+}
+
 test "mailbox deinitialization releases queued payloads and capacity allocation fails" {
     var budget = foundation.memory.AllocationBudget.init(3);
     try std.testing.expectError(error.BudgetExceeded, foundation.memory.SharedBuffer.initCopyWithBudget(std.testing.allocator, "four", .general, &budget, .{}));

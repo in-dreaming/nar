@@ -360,6 +360,12 @@ pub const EventMailbox = struct {
     pub fn poll(self: *EventMailbox) ?AgentEvent {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.terminal) |terminal_event| {
+            if (self.count == 0 or terminal_event.sequence < self.items[self.head].?.sequence) {
+                self.terminal = null;
+                return terminal_event;
+            }
+        }
         return self.popLocked() orelse if (self.terminal) |event| blk: {
             self.terminal = null;
             break :blk event;

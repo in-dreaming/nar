@@ -60,6 +60,8 @@ typedef struct nar_runtime_config {
     uint32_t reserved0;
     uint64_t max_agents, mailbox_capacity, operation_capacity;
     uint64_t compute_workers, blocking_workers, queue_capacity, observability_capacity;
+    /* Capability masks are literal: zero denies all capabilities and
+     * UINT64_MAX is the permissive ceiling. */
     uint64_t build_capabilities, shipping_capabilities, project_capabilities, runtime_capabilities;
     uint32_t shipping, reserved1;
     nar_validate_dispatch_fn validate_dispatch;

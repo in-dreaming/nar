@@ -182,6 +182,8 @@ test "agent loop executes query and action tools before final response" {
     try std.testing.expectEqual(@as(u32, 1), state.move_calls);
     try std.testing.expectEqual(@as(u32, 3), backend.releases);
 
+    try std.testing.expectError(error.InvalidState, agent.submit(.{ .input = "next", .world = &world }));
+
     var final_count: usize = 0;
     while (agent.poll()) |raw_event| {
         var event = raw_event;
@@ -329,4 +331,53 @@ test "trace sink failure fails closed before model dispatch" {
     var terminal = agent.poll().?;
     defer terminal.deinit();
     try std.testing.expect(terminal.payload == .failed and terminal.payload.failed == .storage_error);
+}
+
+test "replay charges the same tool call budget as live dispatch" {
+    var live_backend = ScriptBackend{ .allocator = std.testing.allocator, .mode = .tool_sequence };
+    var live_runtime = try core.Runtime.init(std.testing.allocator, .{});
+    defer live_runtime.deinit();
+    try live_runtime.models.register(live_backend.backend());
+    var live_state = ToolState{};
+    _ = try live_runtime.tools.register(.{ .name = "query_player", .input_schema = "{\"type\":\"object\"}" }, queryPlayer, &live_state);
+    _ = try live_runtime.tools.register(.{ .name = "move_to", .input_schema = "{\"type\":\"object\",\"required\":[\"x\"],\"properties\":{\"x\":{\"type\":\"integer\"}}}" }, moveTo, &live_state);
+    const live_agent = try live_runtime.createAgent(agentConfig());
+    var world = try snapshot();
+    defer world.deinit();
+    var sink = nar.trace.MemorySink.init(std.testing.allocator);
+    defer sink.deinit();
+    var writer = try nar.trace.Writer.init(std.testing.allocator, sink.sink(), .{ .session_id = 10, .runtime_id = nar.RuntimeId.init(10).? }, .{});
+    defer writer.deinit();
+    live_agent.setTraceWriter(&writer);
+    _ = try live_agent.submit(.{ .input = "move", .world = &world });
+    for (0..32) |_| if (live_agent.tick() == .terminal) break;
+    try std.testing.expectEqual(core.TurnState.completed, live_agent.state);
+
+    const bytes = try sink.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var replay_session = try nar.trace.ReplaySession.init(bytes, .strict);
+    var replay_backend = try nar.trace.ReplayBackend.init(std.testing.allocator, &replay_session, .{ .provider_id = "replay", .model_id = "agent-test", .capabilities = .{ .streaming = true, .tool_calling = true } });
+    var replay_runtime = try core.Runtime.init(std.testing.allocator, .{ .replay = &replay_session });
+    defer replay_runtime.deinit();
+    try replay_runtime.models.register(replay_backend.backend());
+    var replay_state = ToolState{};
+    _ = try replay_runtime.tools.register(.{ .name = "query_player", .input_schema = "{\"type\":\"object\"}" }, queryPlayer, &replay_state);
+    _ = try replay_runtime.tools.register(.{ .name = "move_to", .input_schema = "{\"type\":\"object\",\"required\":[\"x\"],\"properties\":{\"x\":{\"type\":\"integer\"}}}" }, moveTo, &replay_state);
+    var replay_config = agentConfig();
+    replay_config.provider_id = "replay";
+    replay_config.definition.default_budget.tool_calls = 1;
+    replay_config.tool_error_policy = .fail_turn;
+    const replay_agent = try replay_runtime.createAgent(replay_config);
+    _ = try replay_agent.submit(.{ .input = "move", .world = &world });
+    for (0..32) |_| if (replay_agent.tick() == .terminal) break;
+    try std.testing.expectEqual(core.TurnState.failed, replay_agent.state);
+    var saw_budget_failure = false;
+    while (replay_agent.poll()) |raw| {
+        var event = raw;
+        defer event.deinit();
+        if (event.payload == .failed and event.payload.failed == .budget_exceeded) saw_budget_failure = true;
+    }
+    try std.testing.expect(saw_budget_failure);
+    try std.testing.expectEqual(@as(u32, 0), replay_state.query_calls);
+    try std.testing.expectEqual(@as(u32, 0), replay_state.move_calls);
 }

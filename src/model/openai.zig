@@ -147,7 +147,7 @@ pub const Backend = struct {
             slot.parser = foundation.sse.Parser.init(self.allocator, .{ .max_field_bytes = self.config.event_limit, .max_event_bytes = self.config.event_limit }, .reject);
             const handle = model.ModelRequestHandle{ .index = @intCast(index), .generation = slot.generation };
             slot.callback = .{ .backend = self, .handle = handle };
-            slot.operation = self.http.startStream(self.allocator, .{ .url = self.config.base_url, .method = .post, .headers = headers.items, .body = body }, .{ .connect_timeout_ms = self.config.connect_timeout_ms, .first_byte_timeout_ms = self.config.first_byte_timeout_ms, .timeout_ms = self.config.timeout_ms, .response_body_limit = self.config.response_limit, .redirects = .deny, .executor = self.completion_executor }, .{ .callback = streamData, .context = &slot.callback }, completed, &slot.callback) catch |err| {
+            slot.operation = self.http.startStream(self.allocator, .{ .url = self.config.base_url, .method = .post, .headers = headers.items, .body = body }, .{ .connect_timeout_ms = self.config.connect_timeout_ms, .first_byte_timeout_ms = self.config.first_byte_timeout_ms, .timeout_ms = self.config.timeout_ms, .response_body_limit = self.config.response_limit, .redirects = .deny, .executor = self.completion_executor }, .{ .callback = streamData, .context = &slot.callback, .head = streamHead }, completed, &slot.callback) catch |err| {
                 slot.reset(self.allocator);
                 return err;
             };
@@ -251,6 +251,20 @@ pub const Backend = struct {
         }
     }
 };
+
+fn streamHead(raw: ?*anyopaque, head: foundation.http.ResponseHead) foundation.http.StreamError!void {
+    const callback: *Callback = @ptrCast(@alignCast(raw.?));
+    const self = callback.backend;
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const slot = self.requestSlot(callback.handle) catch return error.InvalidData;
+    if (slot.cancelled or slot.terminal) return error.Backpressure;
+    if (head.status < 200 or head.status >= 300) {
+        self.push(slot, .{ .@"error" = if (head.status == 408 or head.status == 504) .timeout else .network_error });
+        slot.terminal = true;
+        return error.InvalidData;
+    }
+}
 
 fn streamData(raw: ?*anyopaque, bytes: []const u8) foundation.http.StreamError!void {
     const callback: *Callback = @ptrCast(@alignCast(raw.?));

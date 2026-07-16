@@ -168,6 +168,7 @@ pub const Agent = struct {
     }
     pub fn submit(self: *Agent, request: SubmitRequest) !domain.TurnId {
         if (self.state != .idle and !terminal(self.state)) return error.InvalidState;
+        if (self.mailbox.len() != 0) return error.InvalidState;
         if (!std.unicode.utf8ValidateSlice(request.input)) return error.InvalidArgument;
         if (self.turn) |*old| old.deinit(self.runtime.allocator);
         const id = domain.TurnId.init(self.next_turn) orelse return error.BudgetExceeded;
@@ -357,6 +358,7 @@ pub const Agent = struct {
         }
         if (self.runtime.config.replay) |replay| {
             if (!allowedTool(self.config.definition.allowed_tools, call.name)) return self.toolFailure(turn, .tool_permission_denied);
+            turn.budget.charge(.tool_calls, 1) catch |err| return self.toolFailure(turn, domain.errorCodeFromZig(err));
             turn.tool_result = replay.toolResult(self.runtime.allocator, call.name, call.arguments.items) catch {
                 self.finish(.failed, .model_protocol_error, null);
                 return .terminal;
@@ -485,6 +487,12 @@ pub const Agent = struct {
                 actual_code = .budget_exceeded;
             }
         }
+        if (actual_state == .completed) self.session.append(.turn_outcome, .assistant, turn.output.items) catch {
+            if (final_buffer) |*buffer| buffer.release();
+            final_buffer = null;
+            actual_state = .failed;
+            actual_code = .budget_exceeded;
+        };
         if (!self.writeTrace(.terminal, switch (actual_state) {
             .completed => "{\"reason\":\"completed\"}",
             .cancelled => switch (reason orelse .requested) {
@@ -507,7 +515,6 @@ pub const Agent = struct {
             actual_code = .internal_error;
         };
         self.state = actual_state;
-        if (actual_state == .completed) _ = self.session.append(.turn_outcome, .assistant, turn.output.items) catch {};
     }
     fn writeTrace(self: *Agent, kind: trace.EventType, payload: []const u8) bool {
         if (self.trace_writer) |writer| writer.appendCanonical(kind, payload) catch |err| {

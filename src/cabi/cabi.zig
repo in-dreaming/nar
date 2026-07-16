@@ -226,10 +226,10 @@ fn create(raw: ?*const RuntimeConfig, out: ?*u64) u32 {
         .deterministic => {},
     };
     state.runtime().config.tool_policy = .{
-        .build_hard_limit = .{ .bits = capabilityDefault(config.build_capabilities) },
-        .shipping_policy = .{ .bits = capabilityDefault(config.shipping_capabilities) },
-        .project_policy = .{ .bits = capabilityDefault(config.project_capabilities) },
-        .runtime_override = .{ .bits = capabilityDefault(config.runtime_capabilities) },
+        .build_hard_limit = .{ .bits = config.build_capabilities },
+        .shipping_policy = .{ .bits = config.shipping_capabilities },
+        .project_policy = .{ .bits = config.project_capabilities },
+        .runtime_override = .{ .bits = config.runtime_capabilities },
         .shipping = config.shipping != 0,
     };
     if (state.validate_dispatch != null) state.runtime().config.tool_validator = .{ .context = state, .validate = validateDispatch };
@@ -248,9 +248,6 @@ fn create(raw: ?*const RuntimeConfig, out: ?*u64) u32 {
 fn bounded(value: u64, default: usize, maximum: usize) ?usize {
     const selected = if (value == 0) default else std.math.cast(usize, value) orelse return null;
     return if (selected <= maximum) selected else null;
-}
-fn capabilityDefault(value: u64) u64 {
-    return if (value == 0) std.math.maxInt(u64) else value;
 }
 fn validateDispatch(raw: ?*anyopaque, descriptor: tool.ToolDescriptor, arguments: *const std.json.Value, _: ?nar.ObjectRef, revision: nar.WorldRevision) nar.Error!void {
     const state: *State = @ptrCast(@alignCast(raw.?));
@@ -443,7 +440,7 @@ fn cTool(raw: ?*anyopaque, invocation: tool.InvocationContext) !tool.CallbackRes
         };
         value.retain();
         work.* = .{ .tool = value, .arguments = args, .world_revision = invocation.world_revision, .target = invocation.target };
-        const id = try value.state.operations().submitOwned(.{ .affinity = if (value.affinity == .main) .pump else .compute, .resources = invocation.descriptor.resources }, runCPumpTool, work, deinitCPumpWork);
+        const id = try value.state.operations().submitOwned(.{ .affinity = if (value.affinity == .main) .pump else .compute, .resources = invocation.descriptor.resources, .allow_deferred_completion = true }, runCPumpTool, work, deinitCPumpWork);
         return .{ .pending = id };
     }
     return invokeTool(value, invocation, null);

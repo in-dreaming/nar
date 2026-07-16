@@ -65,6 +65,33 @@ test "operation registry rejects bounded capacity and reuses slots generationall
     try std.testing.expectEqual(nar.core.ExecutionServices.Operations.Result.stale, registry.poll(first, 0));
 }
 
+test "deferred operation remains externally completable after callback returns" {
+    const Deferred = struct {
+        fn start(context: *nar.operation.Context) void {
+            const output: *nar.OperationId = @ptrCast(@alignCast(context.userData().?));
+            output.* = context.operationId();
+        }
+    };
+    var host = try nar.spindle.TestHost.init(std.testing.allocator, 2);
+    defer host.deinit();
+    var captured: nar.OperationId = undefined;
+    const id = try host.operations().submitOwned(.{ .affinity = .pump, .allow_deferred_completion = true }, Deferred.start, &captured, null);
+    try std.testing.expectEqual(@as(usize, 1), host.pump(1, std.time.ns_per_s));
+    try std.testing.expectEqual(id, captured);
+    try std.testing.expectEqual(nar.core.ExecutionServices.Operations.Result.pending, host.operations().poll(id, 0));
+    const payload = try foundation.memory.SharedBuffer.initCopy(std.testing.allocator, "{\"deferred\":true}", .general);
+    try std.testing.expect(host.operations().completeExternal(id, payload));
+    switch (host.operations().poll(id, 0)) {
+        .completed => |buffer| {
+            var owned = buffer;
+            defer owned.release();
+            try std.testing.expectEqualStrings("{\"deferred\":true}", try owned.bytes());
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    host.operations().release(id);
+}
+
 test "owned operation callback data is released once on completion and cancellation" {
     var host = try nar.spindle.TestHost.init(std.testing.allocator, 2);
     var completed_cleanups: usize = 0;

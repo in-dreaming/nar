@@ -133,6 +133,22 @@ test "OpenAI backend maps transport failures, cancellation, and response limits"
     value.release(exhausted);
 }
 
+test "OpenAI backend rejects non-success status before parsing SSE" {
+    var mock = foundation.http.MockClient.init(std.testing.allocator);
+    defer mock.deinit();
+    var immediate = foundation.executor.ImmediateExecutor{};
+    var value = try backend(&mock, immediate.executor(), 1, 4096);
+    defer value.deinit();
+    try mock.append(.{ .response = .{ .status = 500, .body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"unsafe\",\"function\":{\"name\":\"weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n" } });
+    const handle = try value.start(request());
+    defer value.release(handle);
+    mock.pump();
+    var event = (try value.poll(handle)).?;
+    defer event.deinit();
+    try std.testing.expect(event == .@"error" and event.@"error" == .network_error);
+    try std.testing.expect((try value.poll(handle)) == null);
+}
+
 test "OpenAI backend preserves one terminal when event backpressure is exceeded" {
     var mock = foundation.http.MockClient.init(std.testing.allocator);
     defer mock.deinit();

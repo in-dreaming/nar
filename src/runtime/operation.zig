@@ -28,12 +28,14 @@ pub const SubmitOptions = struct {
     affinity: Affinity = .compute,
     deadline_monotonic_ns: ?u64 = null,
     resources: []const tool.ResourceAccess = &.{},
+    /// Allows the callback to return while an external owner retains the
+    /// operation ID and completes it later.
+    allow_deferred_completion: bool = false,
 };
 pub const OperationFn = *const fn (*Context) void;
 pub const ContextDeinitFn = *const fn (std.mem.Allocator, ?*anyopaque) void;
 
-/// Callback context. `complete` consumes `payload` in every case. A callback
-/// that returns without selecting a terminal result is converted to failure.
+/// Callback context. `complete` consumes `payload` in every case.
 pub const Context = struct {
     entry: *Entry,
     /// Returns the stable operation identity supplied to external callbacks.
@@ -76,6 +78,7 @@ const Entry = struct {
     userdata: ?*anyopaque = null,
     userdata_deinit: ?ContextDeinitFn = null,
     resource_handle: ?resource_adapter.Handle = null,
+    allow_deferred_completion: bool = false,
 };
 const Slot = struct { generation: u32 = 1, entry: ?*Entry = null };
 
@@ -146,7 +149,7 @@ pub const Registry = struct {
         };
         const slot = &self.slots.items[index];
         const id = domain.OperationId.fromParts(@intCast(index + 1), slot.generation);
-        entry.* = .{ .registry = self, .id = id, .deadline_monotonic_ns = options.deadline_monotonic_ns, .cancel_source = source, .task = spindle.executor.Task.init(run, null), .callback = callback, .userdata = userdata, .userdata_deinit = userdata_deinit };
+        entry.* = .{ .registry = self, .id = id, .deadline_monotonic_ns = options.deadline_monotonic_ns, .cancel_source = source, .task = spindle.executor.Task.init(run, null), .callback = callback, .userdata = userdata, .userdata_deinit = userdata_deinit, .allow_deferred_completion = options.allow_deferred_completion };
         cleanup = null;
         source = .{ .state = null };
         entry.task.context = entry;
@@ -389,7 +392,7 @@ pub const Registry = struct {
         entry.registry.mutex.unlock();
         var context = Context{ .entry = entry };
         entry.callback(&context);
-        _ = entry.registry.fail(entry, .operation_failed);
+        if (!entry.allow_deferred_completion) _ = entry.registry.fail(entry, .operation_failed);
     }
     fn runResource(raw: ?*anyopaque) !void {
         const entry: *Entry = @ptrCast(@alignCast(raw.?));
@@ -402,7 +405,7 @@ pub const Registry = struct {
         entry.registry.mutex.unlock();
         var context = Context{ .entry = entry };
         entry.callback(&context);
-        _ = entry.registry.fail(entry, .operation_failed);
+        if (!entry.allow_deferred_completion) _ = entry.registry.fail(entry, .operation_failed);
     }
     fn pollErased(raw: ?*anyopaque, id: domain.OperationId, now: u64) core.ExecutionServices.Operations.Result {
         return (@as(*Registry, @ptrCast(@alignCast(raw.?)))).poll(id, now);
