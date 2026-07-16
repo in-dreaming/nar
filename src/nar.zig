@@ -8,6 +8,7 @@ const foundation = @import("foundation");
 /// Stable foundation domain types used by all NAR subsystems.
 pub const domain = @import("foundation/domain.zig");
 pub const ErrorCode = domain.ErrorCode;
+pub const Error = domain.Error;
 pub const RuntimeId = domain.RuntimeId;
 pub const AgentId = domain.AgentId;
 pub const TurnId = domain.TurnId;
@@ -25,6 +26,9 @@ pub const GenerationalRegistry = domain.GenerationalRegistry;
 
 /// Streaming model backend contracts, router, and deterministic mock backend.
 pub const model = @import("model/model.zig");
+
+/// Tool registry, JSON Schema validation, policy enforcement, and dispatch.
+pub const tool = @import("tool/runtime.zig");
 
 /// Build-time configuration selected by the package consumer.
 /// Reading this value is thread-safe and has no ownership or lifetime concerns.
