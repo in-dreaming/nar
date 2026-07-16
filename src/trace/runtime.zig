@@ -179,9 +179,7 @@ pub const Writer = struct {
     }
     /// Encodes tool arguments without retaining secret source bytes.
     pub fn appendToolCall(self: *Writer, tool_name: []const u8, arguments: []const u8, policy: SensitivePolicy) TraceError!void {
-        const safe = try sanitize(self.allocator, arguments, policy);
-        defer self.allocator.free(safe);
-        const payload = std.fmt.allocPrint(self.allocator, "{{\"arguments\":{s},\"policy\":\"{s}\",\"tool\":{f}}}", .{ safe, @tagName(policy), std.json.fmt(tool_name, .{}) }) catch return error.InternalError;
+        const payload = try toolCallPayload(self.allocator, tool_name, arguments, policy);
         defer self.allocator.free(payload);
         try self.appendCanonical(.tool_call, payload);
     }
@@ -284,6 +282,29 @@ pub const ReplaySession = struct {
         defer self.mutex.unlock();
         if (self.divergence != null) return error.Diverged;
         if (!self.terminal_seen or (try self.reader.next()) != null) return error.IncompleteReplay;
+    }
+    /// Replays a recorded tool decision without invoking a live registry,
+    /// callback, operation executor, or pump task. The returned canonical JSON
+    /// is caller-owned and includes the recorded tool result.
+    pub fn toolResult(self: *ReplaySession, allocator: std.mem.Allocator, tool_name: []const u8, arguments: []const u8) ReplayError![]u8 {
+        const actual = toolCallPayload(allocator, tool_name, arguments, .hash) catch return error.InternalError;
+        defer allocator.free(actual);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const call = try self.reader.next() orelse return error.ReplayExhausted;
+        if (call.kind != .tool_call or !std.mem.eql(u8, call.payload, actual)) {
+            self.divergence = .{ .sequence = call.sequence, .path = if (call.kind != .tool_call) "kind" else "payload", .expected = call.payload, .actual = actual };
+            return error.Diverged;
+        }
+        while (try self.reader.next()) |record| switch (record.kind) {
+            .operation_transition, .budget => continue,
+            .tool_result => return allocator.dupe(u8, record.payload) catch error.InternalError,
+            else => {
+                self.divergence = .{ .sequence = record.sequence, .path = "kind", .expected = @tagName(record.kind), .actual = @tagName(EventType.tool_result) };
+                return error.Diverged;
+            },
+        };
+        return error.ReplayExhausted;
     }
     fn nextModel(self: *ReplaySession, expected: EventType) ReplayError!Record {
         self.mutex.lock();
@@ -446,6 +467,11 @@ fn sanitize(allocator: std.mem.Allocator, arguments: []const u8, policy: Sensiti
             break :blk std.fmt.allocPrint(allocator, "\"wyhash64:{x}\"", .{hasher.final()}) catch error.InternalError;
         },
     };
+}
+fn toolCallPayload(allocator: std.mem.Allocator, tool_name: []const u8, arguments: []const u8, policy: SensitivePolicy) TraceError![]u8 {
+    const safe = try sanitize(allocator, arguments, policy);
+    defer allocator.free(safe);
+    return std.fmt.allocPrint(allocator, "{{\"arguments\":{s},\"policy\":\"{s}\",\"tool\":{f}}}", .{ safe, @tagName(policy), std.json.fmt(tool_name, .{}) }) catch error.InternalError;
 }
 fn eventType(value: u16) ?EventType {
     return switch (value) {

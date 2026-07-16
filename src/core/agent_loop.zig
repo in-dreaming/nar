@@ -74,7 +74,14 @@ pub const ExecutionServices = struct {
     operations: Operations = .{},
     io: ?std.Io = null,
 };
-pub const RuntimeConfig = struct { max_agents: usize = 16, mailbox_capacity: usize = 64, services: ExecutionServices = .{} };
+pub const RuntimeConfig = struct {
+    max_agents: usize = 16,
+    mailbox_capacity: usize = 64,
+    services: ExecutionServices = .{},
+    /// Optional offline decision source. When present, tool calls consume
+    /// recorded results and never dispatch registry or executor callbacks.
+    replay: ?*trace.ReplaySession = null,
+};
 pub const AgentConfig = struct { provider_id: []const u8, definition: context.AgentDefinition, tool_error_policy: ToolErrorPolicy = .return_to_model, max_repeated_tool_calls: usize = 2 };
 pub const SubmitRequest = struct { input: []const u8, world: *const context.WorldSnapshot };
 
@@ -337,7 +344,20 @@ pub const Agent = struct {
             self.finishError(err);
             return .terminal;
         };
+        if (self.runtime.config.replay) |replay| {
+            turn.tool_result = replay.toolResult(self.runtime.allocator, call.name, call.arguments.items) catch {
+                self.finish(.failed, .model_protocol_error, null);
+                return .terminal;
+            };
+            self.session.append(.tool_result, .tool, turn.tool_result.?) catch {
+                self.finish(.failed, .budget_exceeded, null);
+                return .terminal;
+            };
+            self.state = .building_context;
+            return .progressed;
+        }
         const handle = self.runtime.tools.handleForName(call.name) orelse return self.toolFailure(turn, .tool_not_found);
+        if (self.trace_writer) |writer| writer.appendToolCall(call.name, call.arguments.items, .hash) catch {};
         var dispatcher = tool.Dispatcher{ .registry = &self.runtime.tools };
         var result = dispatcher.dispatch(.{ .tool = handle, .arguments_json = call.arguments.items });
         defer result.deinit();
@@ -353,7 +373,7 @@ pub const Agent = struct {
                     return .terminal;
                 };
                 self.state = .building_context;
-                self.writeTrace(.tool_result, "{}");
+                self.writeTrace(.tool_result, bytes);
                 return .progressed;
             },
             .pending => |operation| {
@@ -387,6 +407,7 @@ pub const Agent = struct {
                     return .terminal;
                 };
                 self.state = .building_context;
+                self.writeTrace(.tool_result, bytes);
                 self.writeTrace(.operation_transition, "{\"state\":\"completed\"}");
                 return .progressed;
             },

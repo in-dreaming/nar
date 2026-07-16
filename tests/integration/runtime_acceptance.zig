@@ -25,6 +25,11 @@ fn moveAsync(raw: ?*anyopaque, _: nar.tool.InvocationContext) !nar.tool.Callback
     state.operation = id;
     return .{ .pending = id };
 }
+fn unexpectedTool(raw: ?*anyopaque, _: nar.tool.InvocationContext) !nar.tool.CallbackResult {
+    const calls: *usize = @ptrCast(@alignCast(raw.?));
+    calls.* += 1;
+    return .{ .failure = .internal_error };
+}
 fn world() !nar.context.WorldSnapshot {
     return nar.context.WorldSnapshot.initCopy(std.testing.allocator, nar.WorldRevision.fromInt(9), .{ .nanoseconds = 0 }, &.{});
 }
@@ -74,6 +79,23 @@ test "async move reaches waiting operation, requires pump, and preserves trace o
         else => {},
     };
     try std.testing.expect(saw_terminal);
+
+    var replay_session = try nar.trace.ReplaySession.init(bytes, .strict);
+    var replay_backend = try nar.trace.ReplayBackend.init(std.testing.allocator, &replay_session, .{ .provider_id = "replay", .model_id = "script", .capabilities = .{ .streaming = true, .tool_calling = true } });
+    var replay_host = try nar.spindle.TestHost.init(std.testing.allocator, 2);
+    defer replay_host.deinit();
+    replay_host.runtime().config.replay = &replay_session;
+    try replay_host.runtime().models.register(replay_backend.backend());
+    var unexpected_calls: usize = 0;
+    _ = try replay_host.runtime().tools.register(.{ .name = "move_async", .input_schema = "{\"type\":\"object\",\"required\":[\"x\"],\"properties\":{\"x\":{\"type\":\"integer\"}}}" }, unexpectedTool, &unexpected_calls);
+    const replay_agent = try replay_host.runtime().createAgent(.{ .provider_id = "replay", .definition = config().definition });
+    _ = try replay_agent.submit(.{ .input = "move", .world = &snapshot });
+    for (0..24) |_| if (replay_agent.tick() == .terminal) break;
+    try std.testing.expectEqual(nar.core.TurnState.completed, replay_agent.state);
+    try replay_session.expect(.terminal, "{\"reason\":\"completed\"}");
+    try replay_session.finish();
+    try std.testing.expectEqual(@as(usize, 0), unexpected_calls);
+    try std.testing.expectEqual(@as(usize, 0), replay_host.pump(8, std.time.ns_per_s));
 }
 
 test "owner cancellation wins waiting operation and rejects late completion" {
