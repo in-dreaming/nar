@@ -30,6 +30,9 @@ pub const model = @import("model/model.zig");
 /// Tool registry, JSON Schema validation, policy enforcement, and dispatch.
 pub const tool = @import("tool/runtime.zig");
 
+/// Owned context assembly, working-memory session, deterministic tool visibility, and turn budgets.
+pub const context = @import("context/runtime.zig");
+
 /// Build-time configuration selected by the package consumer.
 /// Reading this value is thread-safe and has no ownership or lifetime concerns.
 pub const build_options = @import("nar_build_options");

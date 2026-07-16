@@ -5,6 +5,7 @@ comptime {
     _ = @import("foundation_domain.zig");
     _ = @import("model_stream.zig");
     _ = @import("tool_runtime.zig");
+    _ = @import("context_session_budget.zig");
 }
 
 test "public build configuration is internally consistent" {
