@@ -78,6 +78,7 @@ comptime {
     _ = foundation;
     _ = &cabi.nar_api_version;
     _ = &cabi.nar_runtime_create;
+    _ = &cabi.nar_runtime_register_openai_model;
     _ = &cabi.nar_replay_runtime_create;
     _ = &cabi.nar_runtime_shutdown;
     _ = &cabi.nar_runtime_destroy;

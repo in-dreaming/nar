@@ -38,6 +38,9 @@ pub fn build(b: *std.Build) void {
     nar.addImport("foundation", foundation);
     nar.addImport("spindle", spindle);
     nar.addOptions("nar_build_options", options);
+    if (profile == .runtime) {
+        nar.addImport("curl_adapter", foundation_dependency.module("curl_adapter"));
+    }
 
     const static_library = b.addLibrary(.{
         .name = "nar",
@@ -224,6 +227,9 @@ pub fn build(b: *std.Build) void {
         matrix_nar.addImport("foundation", matrix_foundation);
         matrix_nar.addImport("spindle", matrix_spindle);
         matrix_nar.addOptions("nar_build_options", matrix_options);
+        if (matrix_profile == .runtime) {
+            matrix_nar.addImport("curl_adapter", matrix_foundation_dependency.module("curl_adapter"));
+        }
         const matrix_test = b.addTest(.{
             .name = b.fmt("nar-feature-{s}", .{@tagName(matrix_profile)}),
             .root_module = b.createModule(.{

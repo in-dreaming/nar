@@ -7,6 +7,7 @@ const tool = nar.tool;
 const context = nar.context;
 const operation = nar.operation;
 const trace = nar.trace;
+const curl = if (nar.hasRuntimeSupport()) @import("curl_adapter") else struct {};
 
 const Slice = extern struct { data: ?[*]const u8, size: u64 };
 const ValidateDispatchFn = *const fn (Slice, Slice, u64, ?*anyopaque) callconv(.c) u32;
@@ -14,6 +15,7 @@ const ResourceKey = extern struct { kind: u32, reserved: u32, namespace_high: u6
 const ResourceVersion = extern struct { generation: u64, content_hash: u64, exists: u32, has_content_hash: u32 };
 const ResolveResourceFn = *const fn (*const ResourceKey, *ResourceVersion, ?*anyopaque) callconv(.c) u32;
 const RuntimeConfig = extern struct { struct_size: u32, api_version: u32, profile: u32, reserved0: u32, max_agents: u64, mailbox_capacity: u64, operation_capacity: u64, compute_workers: u64, blocking_workers: u64, queue_capacity: u64, observability_capacity: u64, build_capabilities: u64, shipping_capabilities: u64, project_capabilities: u64, runtime_capabilities: u64, shipping: u32, reserved1: u32, validate_dispatch: ?ValidateDispatchFn, resolve_resource: ?ResolveResourceFn, host_userdata: ?*anyopaque };
+const OpenAiModelConfig = extern struct { struct_size: u32, api_version: u32, provider_id: Slice, model_id: Slice, base_url: Slice, api_key: Slice, curl_library_path: Slice, allowed_origins: ?[*]const Slice, allowed_origin_count: u64, connect_timeout_ms: u64, first_byte_timeout_ms: u64, timeout_ms: u64, response_limit: u64, event_limit: u64, queue_capacity: u64, max_requests: u64 };
 const ResourceAccess = extern struct { struct_size: u32, api_version: u32, key: ResourceKey, mode: u32, range_kind: u32, version_kind: u32, reserved: u32, range_start: u64, range_end: u64, version_value: u64 };
 const ToolDescriptor = extern struct { struct_size: u32, api_version: u32, name: Slice, description: Slice, version: Slice, input_schema: Slice, output_schema: Slice, required_capabilities: u64, resources: ?[*]const ResourceAccess, resource_count: u64, thread_affinity: u32, flags: u32, profile_mask: u32, revision_policy: u32 };
 const Budget = extern struct { wall_time_ns: u64, model_calls: u64, tool_calls: u64, context_tokens: u64, output_tokens: u64, cost_micros: u64, trace_bytes: u64 };
@@ -44,6 +46,32 @@ var runtime_slots: std.ArrayListUnmanaged(RuntimeSlot) = .empty;
 const Host = union(enum) { production: nar.spindle.Host, deterministic: nar.spindle.TestHost };
 const AgentSlot = struct { generation: u32 = 1, agent: ?*CAgent = null };
 const CAgent = struct { agent: *core.Agent, provider: []u8, model: []u8, system: []u8, static: []u8, allowed: [][]const u8 };
+const COpenAiModel = if (nar.hasRuntimeSupport()) struct {
+    provider: []u8,
+    model: []u8,
+    base_url: []u8,
+    api_key: []u8,
+    curl_library_path: []u8,
+    authorization: []u8,
+    allowed_origins: []const []const u8,
+    client: curl.CurlClient,
+    immediate: foundation.executor.ImmediateExecutor = .{},
+    backend: nar.openai.Backend,
+
+    fn deinit(self: *COpenAiModel, allocator: std.mem.Allocator) void {
+        self.backend.deinit();
+        self.client.deinit();
+        for (self.allowed_origins) |origin| allocator.free(@constCast(origin));
+        allocator.free(@constCast(self.allowed_origins));
+        allocator.free(self.authorization);
+        allocator.free(self.curl_library_path);
+        allocator.free(self.api_key);
+        allocator.free(self.base_url);
+        allocator.free(self.model);
+        allocator.free(self.provider);
+        allocator.destroy(self);
+    }
+} else void;
 const State = struct {
     host: Host,
     agents: std.ArrayListUnmanaged(AgentSlot) = .empty,
@@ -54,6 +82,7 @@ const State = struct {
     replay_bytes: ?[]u8 = null,
     replay_session: ?trace.ReplaySession = null,
     replay_backend: ?trace.ReplayBackend = null,
+    openai_models: std.ArrayListUnmanaged(*COpenAiModel) = .empty,
     validate_dispatch: ?ValidateDispatchFn = null,
     resolve_resource: ?ResolveResourceFn = null,
     host_userdata: ?*anyopaque = null,
@@ -70,6 +99,7 @@ const State = struct {
         };
     }
     fn pump(self: *State, jobs: usize, ns: u64) usize {
+        if (comptime nar.hasRuntimeSupport()) for (self.openai_models.items) |model| model.client.pump();
         return switch (self.host) {
             .production => |*v| v.runtime().pumpMainThread(jobs, ns),
             .deterministic => |*v| v.pump(jobs, ns),
@@ -80,6 +110,10 @@ const State = struct {
         self.agents.deinit(self.allocator);
         for (self.tools.items) |tool_value| tool_value.release();
         self.tools.deinit(self.allocator);
+        if (comptime nar.hasRuntimeSupport()) {
+            for (self.openai_models.items) |model| model.deinit(self.allocator);
+            self.openai_models.deinit(self.allocator);
+        }
         _ = switch (self.host) {
             .production => |*v| v.deinit(),
             .deterministic => |*v| v.deinit(),
@@ -150,6 +184,100 @@ pub export fn nar_api_version() callconv(.c) u32 {
 }
 pub export fn nar_runtime_create(raw: ?*const RuntimeConfig, out: ?*u64) callconv(.c) u32 {
     return create(raw, out);
+}
+fn openAiHeaders(raw: ?*anyopaque, allocator: std.mem.Allocator) ![]foundation.http.Header {
+    if (comptime !nar.hasRuntimeSupport()) return allocator.alloc(foundation.http.Header, 0);
+    const entry: *COpenAiModel = @ptrCast(@alignCast(raw.?));
+    if (entry.api_key.len == 0) return allocator.alloc(foundation.http.Header, 0);
+    const headers = try allocator.alloc(foundation.http.Header, 1);
+    headers[0] = .{ .name = "authorization", .value = entry.authorization };
+    return headers;
+}
+fn modelBounded(value: u64, fallback: usize, maximum: usize) ?usize {
+    const selected = if (value == 0) fallback else std.math.cast(usize, value) orelse return null;
+    return if (selected > 0 and selected <= maximum) selected else null;
+}
+pub export fn nar_runtime_register_openai_model(runtime: u64, raw: ?*const OpenAiModelConfig) callconv(.c) u32 {
+    if (comptime !nar.hasRuntimeSupport()) return @intFromEnum(nar.ErrorCode.invalid_state);
+    const state = acquire(runtime) orelse return @intFromEnum(nar.ErrorCode.invalid_state);
+    defer release(state);
+    if (state.host != .production or state.runtime().stopped) return @intFromEnum(nar.ErrorCode.invalid_state);
+    const config = raw orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    if (!validHeader(config.struct_size, @sizeOf(OpenAiModelConfig), config.api_version)) return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const provider_input = slice(config.provider_id.data, config.provider_id.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const model_input = slice(config.model_id.data, config.model_id.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const url_input = slice(config.base_url.data, config.base_url.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const key_input = slice(config.api_key.data, config.api_key.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const curl_input = slice(config.curl_library_path.data, config.curl_library_path.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    if (provider_input.len == 0 or model_input.len == 0 or url_input.len == 0 or curl_input.len == 0) return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const raw_origins = config.allowed_origins orelse if (config.allowed_origin_count != 0) return @intFromEnum(nar.ErrorCode.invalid_argument) else &[_]Slice{};
+    const origin_count = std.math.cast(usize, config.allowed_origin_count) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const connect_timeout = modelBounded(config.connect_timeout_ms, 10_000, 300_000) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const first_byte_timeout = modelBounded(config.first_byte_timeout_ms, 10_000, 300_000) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const timeout = modelBounded(config.timeout_ms, 30_000, 600_000) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const response_limit = modelBounded(config.response_limit, 1024 * 1024, 64 * 1024 * 1024) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const event_limit = modelBounded(config.event_limit, 64 * 1024, 4 * 1024 * 1024) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const queue_capacity = modelBounded(config.queue_capacity, 128, 4096) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const max_requests = modelBounded(config.max_requests, 8, 128) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+
+    const entry = Allocator.create(COpenAiModel) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    errdefer Allocator.destroy(entry);
+    const provider = Allocator.dupe(u8, provider_input) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    errdefer Allocator.free(provider);
+    const model = Allocator.dupe(u8, model_input) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    errdefer Allocator.free(model);
+    const base_url = Allocator.dupe(u8, url_input) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    errdefer Allocator.free(base_url);
+    const api_key = Allocator.dupe(u8, key_input) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    errdefer Allocator.free(api_key);
+    const curl_library_path = Allocator.dupe(u8, curl_input) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    errdefer Allocator.free(curl_library_path);
+    const authorization = std.mem.concat(Allocator, u8, &.{ "Bearer ", api_key }) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    errdefer Allocator.free(authorization);
+    const origins = Allocator.alloc([]const u8, origin_count) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    var initialized: usize = 0;
+    errdefer {
+        for (origins[0..initialized]) |origin| Allocator.free(@constCast(origin));
+        Allocator.free(origins);
+    }
+    for (raw_origins[0..origin_count], 0..) |origin, index| {
+        const bytes = slice(origin.data, origin.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+        if (!std.mem.startsWith(u8, bytes, "https://")) return @intFromEnum(nar.ErrorCode.invalid_argument);
+        origins[index] = Allocator.dupe(u8, bytes) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+        initialized += 1;
+    }
+    entry.* = .{
+        .provider = provider,
+        .model = model,
+        .base_url = base_url,
+        .api_key = api_key,
+        .curl_library_path = curl_library_path,
+        .authorization = authorization,
+        .allowed_origins = origins,
+        .client = curl.CurlClient.init(Allocator, curl_library_path) catch return @intFromEnum(nar.ErrorCode.network_error),
+        .backend = undefined,
+    };
+    errdefer entry.client.deinit();
+    entry.backend = nar.openai.Backend.init(Allocator, .{
+        .provider_id = entry.provider,
+        .base_url = entry.base_url,
+        .model_id = entry.model,
+        .allowed_origins = entry.allowed_origins,
+        .headers = openAiHeaders,
+        .header_context = entry,
+        .connect_timeout_ms = connect_timeout,
+        .first_byte_timeout_ms = first_byte_timeout,
+        .timeout_ms = timeout,
+        .response_limit = response_limit,
+        .event_limit = event_limit,
+        .queue_capacity = queue_capacity,
+        .max_requests = max_requests,
+    }, entry.client.client(), entry.immediate.executor()) catch |err| return code(err);
+    errdefer entry.backend.deinit();
+    state.openai_models.ensureUnusedCapacity(Allocator, 1) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    state.runtime().models.register(entry.backend.backend()) catch |err| return code(err);
+    state.openai_models.appendAssumeCapacity(entry);
+    return @intFromEnum(nar.ErrorCode.ok);
 }
 pub export fn nar_replay_runtime_create(raw: ?*const RuntimeConfig, trace_bytes: Slice, out: ?*u64) callconv(.c) u32 {
     const bytes = slice(trace_bytes.data, trace_bytes.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);

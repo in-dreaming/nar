@@ -281,7 +281,7 @@ fn streamData(raw: ?*anyopaque, bytes: []const u8) foundation.http.StreamError!v
     if (slot.parser) |*parser| parser.feed(bytes, onSse, &parse_context) catch {
         self.protocol(slot);
         return error.InvalidData;
-    } else return error.InvalidData;
+    };
     if (slot.terminal) return;
     if (slot.queue.items.len >= self.config.queue_capacity) return error.Backpressure;
 }
@@ -321,8 +321,13 @@ fn parseChunk(backend: *Backend, slot: *Slot, data: []const u8) !void {
                 if (content.len != 0) backend.push(slot, .{ .text_delta = try foundation.memory.SharedBuffer.initCopy(backend.allocator, content, .network) });
             }
             if (delta.get("tool_calls")) |calls_value| {
-                const calls = array(calls_value) orelse return error.InvalidJson;
-                for (calls.items) |call_value| try parseToolCall(backend, slot, call_value);
+                switch (calls_value) {
+                    .null => {},
+                    else => {
+                        const calls = array(calls_value) orelse return error.InvalidJson;
+                        for (calls.items) |call_value| try parseToolCall(backend, slot, call_value);
+                    },
+                }
             }
         }
         if (choice.get("finish_reason")) |reason_value| switch (reason_value) {
@@ -448,14 +453,28 @@ fn encodeRequest(allocator: std.mem.Allocator, request: model.ModelRequest, mode
     try json.write(model_id);
     try json.objectField("stream");
     try json.write(true);
+    // The current NAR agent loop owns one pending ToolCall per model round.
+    // Explicitly prevent providers from emitting parallel calls in one SSE
+    // response; otherwise the second call is correctly rejected as a model
+    // protocol error by the single-call loop.
+    try json.objectField("parallel_tool_calls");
+    try json.write(false);
     try json.objectField("messages");
     try json.beginArray();
     for (request.messages) |message| {
         try json.beginObject();
         try json.objectField("role");
-        try json.write(@tagName(message.role));
+        // NAR's core records tool results without an OpenAI tool_call_id.
+        // OpenAI-compatible endpoints reject a `tool` role without that ID;
+        // preserve the result as a regular user message for the next planning
+        // iteration instead of emitting an invalid protocol message.
+        try json.write(if (message.role == .tool) "user" else @tagName(message.role));
         try json.objectField("content");
-        if (message.content.len == 1 and message.content[0] == .text) {
+        if (message.role == .tool and message.content.len == 1 and message.content[0] == .text) {
+            const result = try std.fmt.allocPrint(allocator, "TOOL_RESULT (trusted; do not repeat the completed call): {s}", .{message.content[0].text});
+            defer allocator.free(result);
+            try json.write(result);
+        } else if (message.content.len == 1 and message.content[0] == .text) {
             try json.write(message.content[0].text);
         } else {
             try json.beginArray();

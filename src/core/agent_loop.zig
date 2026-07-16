@@ -219,7 +219,15 @@ pub const Agent = struct {
             return .terminal;
         };
         defer descriptors.deinit();
-        var built = (context.ContextBuilder{ .allocator = self.runtime.allocator, .definition = self.config.definition, .resolver_capabilities = self.config.capabilities, .shipping = self.runtime.config.tool_policy.shipping, .runtime_profile = @import("nar_build_options").runtime }).build(.{ .world = &turn.world, .session = &snapshot, .current_input = turn.input, .current_tool_result = turn.tool_result, .descriptors = descriptors.items, .budget = &turn.budget }) catch |err| {
+        var available = std.ArrayListUnmanaged(tool.ToolDescriptor).empty;
+        defer available.deinit(self.runtime.allocator);
+        for (descriptors.items) |descriptor| if (!turn.usedTool(descriptor.name)) {
+            available.append(self.runtime.allocator, descriptor) catch {
+                self.finish(.failed, .budget_exceeded, null);
+                return .terminal;
+            };
+        };
+        var built = (context.ContextBuilder{ .allocator = self.runtime.allocator, .definition = self.config.definition, .resolver_capabilities = self.config.capabilities, .shipping = self.runtime.config.tool_policy.shipping, .runtime_profile = @import("nar_build_options").runtime }).build(.{ .world = &turn.world, .session = &snapshot, .current_input = turn.input, .current_tool_result = turn.tool_result, .descriptors = available.items, .budget = &turn.budget }) catch |err| {
             self.finishError(err);
             return .terminal;
         };
@@ -359,6 +367,7 @@ pub const Agent = struct {
         if (self.runtime.config.replay) |replay| {
             if (!allowedTool(self.config.definition.allowed_tools, call.name)) return self.toolFailure(turn, .tool_permission_denied);
             turn.budget.charge(.tool_calls, 1) catch |err| return self.toolFailure(turn, domain.errorCodeFromZig(err));
+            turn.recordTool(self.runtime.allocator, call.name) catch return self.toolFailure(turn, .budget_exceeded);
             turn.tool_result = replay.toolResult(self.runtime.allocator, call.name, call.arguments.items) catch {
                 self.finish(.failed, .model_protocol_error, null);
                 return .terminal;
@@ -372,6 +381,7 @@ pub const Agent = struct {
         }
         const handle = self.runtime.tools.handleForName(call.name) orelse return self.toolFailure(turn, .tool_not_found);
         if (!allowedTool(self.config.definition.allowed_tools, call.name)) return self.toolFailure(turn, .tool_permission_denied);
+        turn.recordTool(self.runtime.allocator, call.name) catch return self.toolFailure(turn, .budget_exceeded);
         if (!self.writeToolCall(call.name, call.arguments.items)) return self.finishTraceFailure();
         var policy = self.runtime.config.tool_policy;
         policy.agent_policy = self.config.capabilities;
@@ -611,8 +621,17 @@ const Turn = struct {
     operation: ?domain.OperationId = null,
     output: std.ArrayListUnmanaged(u8) = .empty,
     loop_keys: std.StringHashMapUnmanaged(usize) = .empty,
+    used_tools: std.ArrayListUnmanaged([]u8) = .empty,
     fn init(allocator: std.mem.Allocator, id: domain.TurnId, submit: SubmitRequest, time: u64, limits: context.TurnBudgetLimits) !Turn {
         return .{ .id = id, .input = try allocator.dupe(u8, submit.input), .world = try context.WorldSnapshot.initCopy(allocator, submit.world.revision, submit.world.captured_at, submit.world.sections), .budget = context.TurnBudget.init(limits, time) };
+    }
+    fn usedTool(self: *const Turn, name: []const u8) bool {
+        for (self.used_tools.items) |used| if (std.mem.eql(u8, used, name)) return true;
+        return false;
+    }
+    fn recordTool(self: *Turn, allocator: std.mem.Allocator, name: []const u8) !void {
+        if (self.usedTool(name)) return;
+        try self.used_tools.append(allocator, try allocator.dupe(u8, name));
     }
     fn deinit(self: *Turn, allocator: std.mem.Allocator) void {
         if (self.request) |request| request.backend.release(request.handle);
@@ -625,6 +644,8 @@ const Turn = struct {
         var keys = self.loop_keys.keyIterator();
         while (keys.next()) |key| allocator.free(key.*);
         self.loop_keys.deinit(allocator);
+        for (self.used_tools.items) |name| allocator.free(name);
+        self.used_tools.deinit(allocator);
     }
 };
 fn terminal(state: TurnState) bool {

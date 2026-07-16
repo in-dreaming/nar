@@ -147,6 +147,41 @@ test "C ABI rejects corrupt replay and oversized runtime configuration" {
     try expectCode(c.NAR_INVALID_ARGUMENT, abi.nar_runtime_create(@ptrCast(&cfg), &runtime));
 }
 
+test "C ABI validates OpenAI-compatible model registration before loading curl" {
+    var cfg = config();
+    cfg.profile = c.NAR_PROFILE_RUNTIME;
+    cfg.compute_workers = 1;
+    cfg.blocking_workers = 1;
+    var runtime: c.nar_runtime_handle = 0;
+    if (!nar.hasRuntimeSupport()) {
+        try expectCode(c.NAR_INVALID_STATE, abi.nar_runtime_register_openai_model(0, null));
+        return;
+    }
+    try expectCode(c.NAR_OK, abi.nar_runtime_create(@ptrCast(&cfg), &runtime));
+    defer abi.nar_runtime_destroy(runtime);
+    var model_config = c.nar_openai_model_config{
+        .struct_size = @sizeOf(c.nar_openai_model_config),
+        .api_version = c.NAR_API_VERSION,
+        .provider_id = .{ .data = "openai-compatible".ptr, .size = "openai-compatible".len },
+        .model_id = .{ .data = "fixture".ptr, .size = "fixture".len },
+        .base_url = .{ .data = "http://example.invalid/v1/chat/completions".ptr, .size = "http://example.invalid/v1/chat/completions".len },
+        .api_key = .{ .data = null, .size = 0 },
+        .curl_library_path = .{ .data = null, .size = 0 },
+        .allowed_origins = null,
+        .allowed_origin_count = 0,
+        .connect_timeout_ms = 0,
+        .first_byte_timeout_ms = 0,
+        .timeout_ms = 0,
+        .response_limit = 0,
+        .event_limit = 0,
+        .queue_capacity = 0,
+        .max_requests = 0,
+    };
+    try expectCode(c.NAR_INVALID_ARGUMENT, abi.nar_runtime_register_openai_model(runtime, @ptrCast(&model_config)));
+    model_config.curl_library_path = .{ .data = "missing-curl.dll".ptr, .size = "missing-curl.dll".len };
+    try expectCode(c.NAR_NETWORK_ERROR, abi.nar_runtime_register_openai_model(runtime, @ptrCast(&model_config)));
+}
+
 test "C runtime reports an expired finite staged shutdown deadline" {
     if (!nar.hasRuntimeSupport()) return;
     var cfg = config();

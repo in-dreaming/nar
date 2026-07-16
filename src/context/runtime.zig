@@ -258,7 +258,12 @@ pub const ContextBuilder = struct {
         const history_start = if (input.session.entries.len > self.definition.context_strategy.max_history_messages) input.session.entries.len - self.definition.context_strategy.max_history_messages else 0;
         for (input.session.entries, 0..) |entry, index| try entries.append(self.allocator, .{ .source = .history, .role = entry.role, .text = entry.content, .mandatory = false, .strategy_trimmed = index < history_start });
         try entries.append(self.allocator, .{ .source = .current_input, .role = .user, .text = input.current_input, .mandatory = true });
-        if (input.current_tool_result) |result| try entries.append(self.allocator, .{ .source = .tool_result, .role = .tool, .text = result, .mandatory = true });
+        if (input.current_tool_result) |result| {
+            const already_in_history = input.session.entries.len != 0 and
+                input.session.entries[input.session.entries.len - 1].role == .tool and
+                std.mem.eql(u8, input.session.entries[input.session.entries.len - 1].content, result);
+            if (!already_in_history) try entries.append(self.allocator, .{ .source = .tool_result, .role = .tool, .text = result, .mandatory = true });
+        }
         var kept = try self.allocator.alloc(bool, entries.items.len);
         defer self.allocator.free(kept);
         for (entries.items, 0..) |entry, index| kept[index] = !entry.strategy_trimmed;

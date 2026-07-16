@@ -69,6 +69,20 @@ typedef struct nar_runtime_config {
     void *host_userdata;
 } nar_runtime_config;
 
+/* Registers one OpenAI Chat Completions compatible streaming model on a
+ * runtime-profile host. Every slice is copied during registration. Remote
+ * origins must be HTTPS and explicitly listed in allowed_origins; localhost
+ * HTTP is allowed for development fixtures. api_key is only used to create a
+ * temporary Authorization request header. curl_library_path identifies the
+ * libcurl dynamic library used by the runtime transport. */
+typedef struct nar_openai_model_config {
+    uint32_t struct_size, api_version;
+    nar_slice provider_id, model_id, base_url, api_key, curl_library_path;
+    const nar_slice *allowed_origins; uint64_t allowed_origin_count;
+    uint64_t connect_timeout_ms, first_byte_timeout_ms, timeout_ms;
+    uint64_t response_limit, event_limit, queue_capacity, max_requests;
+} nar_openai_model_config;
+
 typedef struct nar_budget { uint64_t wall_time_ns, model_calls, tool_calls, context_tokens, output_tokens, cost_micros, trace_bytes; } nar_budget;
 typedef struct nar_resource_access {
     uint32_t struct_size, api_version;
@@ -105,6 +119,7 @@ typedef struct nar_event { uint32_t struct_size, api_version; nar_event_kind kin
 
 uint32_t nar_api_version(void);
 nar_error_code nar_runtime_create(const nar_runtime_config *, nar_runtime_handle *);
+nar_error_code nar_runtime_register_openai_model(nar_runtime_handle, const nar_openai_model_config *);
 /* Validates and copies a complete trace. The replay model route is
  * provider_id="replay", model_id="replay" and never falls back to HTTP. */
 nar_error_code nar_replay_runtime_create(const nar_runtime_config *, nar_slice trace, nar_runtime_handle *);
