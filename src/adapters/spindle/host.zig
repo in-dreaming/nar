@@ -8,6 +8,7 @@ pub const Config = struct {
     compute_workers: usize = 1,
     blocking_workers: usize = 1,
     queue_capacity: usize = 64,
+    operation_capacity: usize = 64,
     observability_capacity: usize = 128,
     fault: spindle.runtime.Fault = .none,
 };
@@ -25,6 +26,7 @@ pub const Host = struct {
         nar_runtime: core.Runtime,
     };
 
+    /// Allocates an address-stable owner and starts configured worker services.
     pub fn init(allocator: std.mem.Allocator, config: Config) !Host {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
@@ -40,21 +42,25 @@ pub const Host = struct {
             .fault = config.fault,
         });
         errdefer state.spindle_runtime.deinit();
-        state.operations = try operation.Registry.init(allocator, .{}, state.spindle_runtime.computeExecutor(), state.spindle_runtime.blockingExecutor(), state.spindle_runtime.pumpExecutor());
+        state.operations = try operation.Registry.init(allocator, .{ .capacity = config.operation_capacity }, state.spindle_runtime.computeExecutor(), state.spindle_runtime.blockingExecutor(), state.spindle_runtime.pumpExecutor());
         errdefer state.operations.deinit();
         state.nar_runtime = try core.Runtime.init(allocator, .{ .services = servicesFor(&state.spindle_runtime, state.threaded.io(), state.operations.services()) });
         return .{ .state = state };
     }
 
+    /// Returns a borrowed runtime pointer valid until `deinit` begins.
     pub fn runtime(self: *Host) *core.Runtime {
         return &self.state.nar_runtime;
     }
+    /// Returns borrowed services which must not outlive this host.
     pub fn services(self: *Host) core.ExecutionServices {
-        return servicesFor(&self.state.spindle_runtime, self.state.threaded.io());
+        return servicesFor(&self.state.spindle_runtime, self.state.threaded.io(), self.state.operations.services());
     }
+    /// Returns the owned Spindle runtime for diagnostics and staged shutdown.
     pub fn spindleRuntime(self: *Host) *spindle.runtime.Runtime {
         return &self.state.spindle_runtime;
     }
+    /// Returns the host-owned thread-safe operation registry.
     pub fn operations(self: *Host) *operation.Registry {
         return &self.state.operations;
     }
@@ -66,6 +72,7 @@ pub const Host = struct {
         return self.state.spindle_runtime.shutdown(deadline_monotonic_ns);
     }
 
+    /// Converges shutdown and destroys NAR, Spindle, then threaded I/O state.
     pub fn deinit(self: *Host) void {
         const state = self.state;
         _ = self.shutdown(null);
@@ -95,7 +102,12 @@ pub const TestHost = struct {
         nar_runtime: core.Runtime,
     };
 
+    /// Creates a no-thread host with the default operation capacity.
     pub fn init(allocator: std.mem.Allocator, queue_capacity: usize) !TestHost {
+        return initWithOperationCapacity(allocator, queue_capacity, 64);
+    }
+    /// Creates a no-thread host with explicit bounded queue/table capacities.
+    pub fn initWithOperationCapacity(allocator: std.mem.Allocator, queue_capacity: usize, operation_capacity: usize) !TestHost {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
         state.allocator = allocator;
@@ -106,33 +118,41 @@ pub const TestHost = struct {
         state.pump_executor = try spindle.executor.PumpExecutor.init(allocator, queue_capacity);
         errdefer state.pump_executor.deinit();
         state.event_ring = spindle.observability.event.RingSink.init(&state.event_storage);
-        state.operations = try operation.Registry.init(allocator, .{}, state.compute.executor(), state.blocking.executor(), state.pump_executor.executor());
+        state.operations = try operation.Registry.init(allocator, .{ .capacity = operation_capacity }, state.compute.executor(), state.blocking.executor(), state.pump_executor.executor());
         errdefer state.operations.deinit();
         state.nar_runtime = try core.Runtime.init(allocator, .{ .services = servicesForState(state) });
         return .{ .state = state };
     }
 
+    /// Returns a borrowed runtime pointer valid until `deinit`.
     pub fn runtime(self: *TestHost) *core.Runtime {
         return &self.state.nar_runtime;
     }
+    /// Advances the synchronized virtual monotonic clock.
     pub fn advance(self: *TestHost, nanoseconds: u64) void {
         self.state.clock_source.advance(nanoseconds, @intCast(nanoseconds / std.time.ns_per_ms));
     }
+    /// Runs bounded caller-thread work without implicitly advancing time.
     pub fn pump(self: *TestHost, max_jobs: usize, max_ns: u64) usize {
         return self.state.pump_executor.drainFor(max_jobs, max_ns);
     }
+    /// Submits a caller-owned intrusive task; it must outlive queue retirement.
     pub fn submitPump(self: *TestHost, task: *spindle.executor.Task) spindle.executor.SubmitError!void {
         try self.state.pump_executor.submit(task, .{});
     }
+    /// Returns the deterministic host's operation registry.
     pub fn operations(self: *TestHost) *operation.Registry {
         return &self.state.operations;
     }
+    /// Drains deterministic compute work on the caller thread.
     pub fn runCompute(self: *TestHost) !void {
         try self.state.compute.run();
     }
+    /// Returns borrowed deterministic services valid until `deinit`.
     pub fn services(self: *TestHost) core.ExecutionServices {
         return servicesForState(self.state);
     }
+    /// Cancels active work and releases all deterministic host state.
     pub fn deinit(self: *TestHost) void {
         const state = self.state;
         state.nar_runtime.deinit();

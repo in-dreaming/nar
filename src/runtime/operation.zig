@@ -23,11 +23,21 @@ pub const SubmitOptions = struct {
     deadline_monotonic_ns: ?u64 = null,
 };
 pub const OperationFn = *const fn (*Context) void;
+pub const ContextDeinitFn = *const fn (std.mem.Allocator, ?*anyopaque) void;
 
 /// Callback context. `complete` consumes `payload` in every case. A callback
 /// that returns without selecting a terminal result is converted to failure.
 pub const Context = struct {
     entry: *Entry,
+    /// Returns the stable operation identity supplied to external callbacks.
+    pub fn operationId(self: *const Context) domain.OperationId {
+        return self.entry.id;
+    }
+    /// Returns caller-owned data retained by `submitOwned` until the Spindle
+    /// task and all queue references have retired.
+    pub fn userData(self: *const Context) ?*anyopaque {
+        return self.entry.userdata;
+    }
     pub fn isCancelled(self: *const Context) bool {
         var token = self.entry.cancel_source.token();
         defer token.deinit();
@@ -56,6 +66,8 @@ const Entry = struct {
     cancel_source: domain.CancellationSource,
     task: spindle.executor.Task,
     callback: OperationFn,
+    userdata: ?*anyopaque = null,
+    userdata_deinit: ?ContextDeinitFn = null,
 };
 const Slot = struct { generation: u32 = 1, entry: ?*Entry = null };
 
@@ -93,8 +105,18 @@ pub const Registry = struct {
         self.* = undefined;
     }
     pub fn submit(self: *Registry, options: SubmitOptions, callback: OperationFn) !domain.OperationId {
+        return self.submitOwned(options, callback, null, null);
+    }
+    /// Submits an operation that owns `userdata`. `userdata_deinit` runs once
+    /// after the intrusive task can no longer be observed by an executor,
+    /// including submission failure, cancellation, and shutdown paths.
+    pub fn submitOwned(self: *Registry, options: SubmitOptions, callback: OperationFn, userdata: ?*anyopaque, userdata_deinit: ?ContextDeinitFn) !domain.OperationId {
+        var cleanup = userdata_deinit;
         const entry = try self.allocator.create(Entry);
-        errdefer self.allocator.destroy(entry);
+        errdefer {
+            if (cleanup) |deinit_fn| deinit_fn(self.allocator, userdata);
+            self.allocator.destroy(entry);
+        }
         var source = try domain.CancellationSource.init(self.allocator);
         errdefer if (source.state != null) source.deinit();
         self.mutex.lock();
@@ -115,7 +137,8 @@ pub const Registry = struct {
         };
         const slot = &self.slots.items[index];
         const id = domain.OperationId.fromParts(@intCast(index + 1), slot.generation);
-        entry.* = .{ .registry = self, .id = id, .deadline_monotonic_ns = options.deadline_monotonic_ns, .cancel_source = source, .task = spindle.executor.Task.init(run, null), .callback = callback };
+        entry.* = .{ .registry = self, .id = id, .deadline_monotonic_ns = options.deadline_monotonic_ns, .cancel_source = source, .task = spindle.executor.Task.init(run, null), .callback = callback, .userdata = userdata, .userdata_deinit = userdata_deinit };
+        cleanup = null;
         source = .{ .state = null };
         entry.task.context = entry;
         slot.entry = entry;
@@ -304,6 +327,7 @@ pub const Registry = struct {
             else => {},
         }
         entry.cancel_source.deinit();
+        if (entry.userdata_deinit) |deinit_fn| deinit_fn(self.allocator, entry.userdata);
         self.allocator.destroy(entry);
     }
     fn collectRetiredLocked(self: *Registry) void {

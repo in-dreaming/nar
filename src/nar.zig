@@ -1,7 +1,8 @@
 //! Native Agent Runtime public Zig module.
 //!
-//! This bootstrap surface intentionally exposes only build configuration. Agent
-//! behavior and C ABI entry points are added by their dedicated tasks.
+//! Hosts own execution services; agents borrow them, expose pull events, and
+//! must be shut down before their host. See the repository README for profile,
+//! pumping, cancellation, replay, and C buffer ownership contracts.
 
 const foundation = @import("foundation");
 
@@ -73,4 +74,22 @@ pub fn hasRuntimeSupport() bool {
 
 comptime {
     _ = foundation;
+    _ = &cabi.nar_api_version;
+    _ = &cabi.nar_runtime_create;
+    _ = &cabi.nar_replay_runtime_create;
+    _ = &cabi.nar_runtime_shutdown;
+    _ = &cabi.nar_runtime_destroy;
+    _ = &cabi.nar_tool_register;
+    _ = &cabi.nar_tool_unregister;
+    _ = &cabi.nar_agent_create;
+    _ = &cabi.nar_agent_destroy;
+    _ = &cabi.nar_agent_submit;
+    _ = &cabi.nar_agent_tick;
+    _ = &cabi.nar_runtime_pump_main_thread;
+    _ = &cabi.nar_agent_poll;
+    _ = &cabi.nar_agent_cancel;
+    _ = &cabi.nar_operation_complete;
+    _ = &cabi.nar_operation_fail;
+    _ = &cabi.nar_operation_cancel;
+    _ = &cabi.nar_buffer_release;
 }

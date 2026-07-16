@@ -6,6 +6,7 @@ const core = nar.core;
 const tool = nar.tool;
 const context = nar.context;
 const operation = nar.operation;
+const trace = nar.trace;
 
 const Slice = extern struct { data: ?[*]const u8, size: usize };
 const RuntimeConfig = extern struct { struct_size: u32, api_version: u32, profile: u32, reserved0: u32, max_agents: u64, mailbox_capacity: u64, operation_capacity: u64, compute_workers: u64, blocking_workers: u64, queue_capacity: u64, observability_capacity: u64 };
@@ -46,6 +47,9 @@ const State = struct {
     users: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     destroying: bool = false,
     allocator: std.mem.Allocator = Allocator,
+    replay_bytes: ?[]u8 = null,
+    replay_session: ?trace.ReplaySession = null,
+    replay_backend: ?trace.ReplayBackend = null,
     fn runtime(self: *State) *core.Runtime {
         return switch (self.host) {
             .production => |*v| v.runtime(),
@@ -67,12 +71,13 @@ const State = struct {
     fn deinit(self: *State) void {
         for (self.agents.items) |slot| if (slot.agent) |agent| self.destroyAgent(agent);
         self.agents.deinit(self.allocator);
-        for (self.tools.items) |tool_value| self.allocator.destroy(tool_value);
+        for (self.tools.items) |tool_value| tool_value.release();
         self.tools.deinit(self.allocator);
         _ = switch (self.host) {
             .production => |*v| v.deinit(),
             .deterministic => |*v| v.deinit(),
         };
+        if (self.replay_bytes) |bytes| self.allocator.free(bytes);
         self.allocator.destroy(self);
     }
     fn destroyAgent(self: *State, value: *CAgent) void {
@@ -139,22 +144,70 @@ pub export fn nar_runtime_create(raw: ?*const RuntimeConfig, out: ?*u64) callcon
     return create(raw, out);
 }
 pub export fn nar_replay_runtime_create(raw: ?*const RuntimeConfig, trace_bytes: Slice, out: ?*u64) callconv(.c) u32 {
-    _ = trace_bytes;
-    return create(raw, out);
+    const bytes = slice(trace_bytes.data, trace_bytes.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    if (bytes.len == 0) return @intFromEnum(nar.ErrorCode.invalid_argument);
+    var runtime: u64 = 0;
+    const created = create(raw, &runtime);
+    if (created != 0) return created;
+    const state = acquire(runtime) orelse {
+        nar_runtime_destroy(runtime);
+        return @intFromEnum(nar.ErrorCode.internal_error);
+    };
+    var failure: u32 = 0;
+    const owned = state.allocator.dupe(u8, bytes) catch null;
+    if (owned) |trace_copy| {
+        state.replay_bytes = trace_copy;
+        const replay_session = trace.ReplaySession.init(trace_copy, .semantic) catch null;
+        if (replay_session) |session| {
+            state.replay_session = session;
+        } else {
+            state.allocator.free(trace_copy);
+            state.replay_bytes = null;
+            failure = @intFromEnum(nar.ErrorCode.invalid_argument);
+        }
+        if (failure == 0) {
+            const replay_backend = trace.ReplayBackend.init(state.allocator, &state.replay_session.?, .{
+                .provider_id = "replay",
+                .model_id = "replay",
+                .capabilities = .{ .streaming = true, .tool_calling = true },
+            }) catch null;
+            if (replay_backend) |backend| {
+                state.replay_backend = backend;
+            } else {
+                failure = @intFromEnum(nar.ErrorCode.internal_error);
+            }
+            if (failure == 0) state.runtime().models.register(state.replay_backend.?.backend()) catch {
+                failure = @intFromEnum(nar.ErrorCode.internal_error);
+            };
+        }
+    } else failure = @intFromEnum(nar.ErrorCode.budget_exceeded);
+    release(state);
+    if (failure != 0) {
+        nar_runtime_destroy(runtime);
+        return failure;
+    }
+    out.?.* = runtime;
+    return @intFromEnum(nar.ErrorCode.ok);
 }
 fn create(raw: ?*const RuntimeConfig, out: ?*u64) u32 {
     const config = raw orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
     if (out == null or !validHeader(config.struct_size, @sizeOf(RuntimeConfig), config.api_version)) return @intFromEnum(nar.ErrorCode.invalid_argument);
     if (config.profile > 1) return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const max_agents = bounded(config.max_agents, 16, 4096) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const mailbox_capacity = bounded(config.mailbox_capacity, 64, 1 << 20) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const operation_capacity = bounded(config.operation_capacity, 64, 1 << 20) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const compute_workers = bounded(config.compute_workers, 1, 1024) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const blocking_workers = bounded(config.blocking_workers, 1, 1024) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const queue_capacity = bounded(config.queue_capacity, 64, 1 << 20) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const observability_capacity = bounded(config.observability_capacity, 128, 1 << 20) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
     const state = Allocator.create(State) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
     errdefer Allocator.destroy(state);
-    const max_agents: usize = @intCast(if (config.max_agents == 0) 16 else config.max_agents);
-    if (config.profile == 0) state.* = .{ .host = .{ .deterministic = nar.spindle.TestHost.init(Allocator, @intCast(if (config.queue_capacity == 0) 64 else config.queue_capacity)) catch |err| return code(err) } } else {
+    if (config.profile == 0) state.* = .{ .host = .{ .deterministic = nar.spindle.TestHost.initWithOperationCapacity(Allocator, queue_capacity, operation_capacity) catch |err| return code(err) } } else {
         if (!nar.hasRuntimeSupport()) return @intFromEnum(nar.ErrorCode.invalid_state);
-        state.* = .{ .host = .{ .production = nar.spindle.Host.init(Allocator, .{ .compute_workers = @intCast(if (config.compute_workers == 0) 1 else config.compute_workers), .blocking_workers = @intCast(if (config.blocking_workers == 0) 1 else config.blocking_workers), .queue_capacity = @intCast(if (config.queue_capacity == 0) 64 else config.queue_capacity), .observability_capacity = @intCast(if (config.observability_capacity == 0) 128 else config.observability_capacity) }) catch |err| return code(err) } };
+        state.* = .{ .host = .{ .production = nar.spindle.Host.init(Allocator, .{ .compute_workers = compute_workers, .blocking_workers = blocking_workers, .queue_capacity = queue_capacity, .operation_capacity = operation_capacity, .observability_capacity = observability_capacity }) catch |err| return code(err) } };
     }
     state.runtime().config.max_agents = max_agents;
-    state.runtime().config.mailbox_capacity = @intCast(if (config.mailbox_capacity == 0) 64 else config.mailbox_capacity);
+    state.runtime().config.mailbox_capacity = mailbox_capacity;
     runtime_mutex.lock();
     defer runtime_mutex.unlock();
     var index: usize = 0;
@@ -167,14 +220,24 @@ fn create(raw: ?*const RuntimeConfig, out: ?*u64) u32 {
     out.?.* = handle(index, runtime_slots.items[index].generation);
     return @intFromEnum(nar.ErrorCode.ok);
 }
+fn bounded(value: u64, default: usize, maximum: usize) ?usize {
+    const selected = if (value == 0) default else std.math.cast(usize, value) orelse return null;
+    return if (selected <= maximum) selected else null;
+}
 pub export fn nar_runtime_shutdown(value: u64, deadline: u64) callconv(.c) u32 {
     const state = acquire(value) orelse return @intFromEnum(nar.ErrorCode.invalid_state);
     defer release(state);
-    _ = switch (state.host) {
-        .production => |*v| v.shutdown(if (deadline == 0) null else deadline),
-        .deterministic => |*v| v.runtime().shutdown(),
+    return switch (state.host) {
+        .production => |*v| blk: {
+            const report = v.shutdown(if (deadline == 0) null else deadline);
+            if (report.failed_stage != null) break :blk @intFromEnum(nar.ErrorCode.internal_error);
+            break :blk @intFromEnum(if (report.completed) nar.ErrorCode.ok else nar.ErrorCode.timeout);
+        },
+        .deterministic => |*v| blk: {
+            v.runtime().shutdown();
+            break :blk @intFromEnum(nar.ErrorCode.ok);
+        },
     };
-    return @intFromEnum(nar.ErrorCode.ok);
 }
 pub export fn nar_runtime_destroy(value: u64) callconv(.c) void {
     runtime_mutex.lock();
@@ -210,17 +273,43 @@ pub export fn nar_tool_register(runtime: u64, raw: ?*const ToolDescriptor, callb
     const d = raw orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
     if (state.runtime().stopped) return @intFromEnum(nar.ErrorCode.invalid_state);
     if (callback == null or out == null or !validHeader(d.struct_size, @sizeOf(ToolDescriptor), d.api_version)) return @intFromEnum(nar.ErrorCode.invalid_argument);
+    if (d.thread_affinity > 2 or d.flags > 3 or d.profile_mask > 3 or d.revision_policy > 1) return @intFromEnum(nar.ErrorCode.invalid_argument);
+    if (d.thread_affinity == 2 and state.host == .deterministic) return @intFromEnum(nar.ErrorCode.invalid_state);
     const name = slice(d.name.data, d.name.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const description = slice(d.description.data, d.description.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const version = slice(d.version.data, d.version.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
     const schema = slice(d.input_schema.data, d.input_schema.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const output_schema = optionalSlice(d.output_schema.data, d.output_schema.size);
+    if (d.output_schema.data == null and d.output_schema.size != 0) return @intFromEnum(nar.ErrorCode.invalid_argument);
+    const raw_resources = d.resources orelse if (d.resource_count != 0) return @intFromEnum(nar.ErrorCode.invalid_argument) else &[_]ResourceAccess{};
+    const resources = Allocator.alloc(tool.ResourceAccess, d.resource_count) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
+    defer Allocator.free(resources);
+    for (raw_resources[0..d.resource_count], 0..) |resource, index| {
+        if (resource.key == 0 or resource.mode > 1 or resource.reserved != 0) return @intFromEnum(nar.ErrorCode.invalid_argument);
+        resources[index] = .{ .key = resource.key, .mode = if (resource.mode == 0) .read else .write };
+    }
     const entry = Allocator.create(CTool) catch return @intFromEnum(nar.ErrorCode.budget_exceeded);
-    entry.* = .{ .callback = callback.?, .userdata = userdata, .main = d.thread_affinity == 1, .state = state };
-    const registered = state.runtime().tools.register(.{ .name = name, .description = slice(d.description.data, d.description.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument), .version = slice(d.version.data, d.version.size) orelse return @intFromEnum(nar.ErrorCode.invalid_argument), .input_schema = schema, .output_schema = optionalSlice(d.output_schema.data, d.output_schema.size), .thread_affinity = if (entry.main) .main else .any, .required_capabilities = .{ .bits = d.required_capabilities } }, cTool, entry) catch |err| {
-        Allocator.destroy(entry);
+    entry.* = .{ .callback = callback.?, .userdata = userdata, .affinity = @enumFromInt(d.thread_affinity), .state = state };
+    const profile_bits = if (d.profile_mask == 0) 3 else d.profile_mask;
+    const registered = state.runtime().tools.register(.{
+        .name = name,
+        .description = description,
+        .version = version,
+        .input_schema = schema,
+        .output_schema = output_schema,
+        .flags = .{ .debug_only = (d.flags & 1) != 0, .deterministic = (d.flags & 2) != 0 },
+        .thread_affinity = .any,
+        .required_capabilities = .{ .bits = d.required_capabilities },
+        .resources = resources,
+        .revision_policy = if (d.revision_policy == 0) .none else .exact,
+        .profiles = .{ .minimal = (profile_bits & 1) != 0, .runtime = (profile_bits & 2) != 0 },
+    }, cTool, entry) catch |err| {
+        entry.release();
         return code(err);
     };
     state.tools.append(Allocator, entry) catch {
         state.runtime().tools.unregister(registered) catch {};
-        Allocator.destroy(entry);
+        entry.release();
         return @intFromEnum(nar.ErrorCode.budget_exceeded);
     };
     entry.handle = registered;
@@ -239,11 +328,24 @@ pub export fn nar_tool_unregister(runtime: u64, value: u64) callconv(.c) u32 {
         _ = state.tools.swapRemove(index);
         break;
     };
-    Allocator.destroy(c);
+    c.release();
     return 0;
 }
 
-const CTool = struct { callback: *const fn (*const Invocation, *ResultSink, ?*anyopaque) callconv(.c) void, userdata: ?*anyopaque, main: bool, state: *State, handle: tool.ToolHandle = .{} };
+const CTool = struct {
+    callback: *const fn (*const Invocation, *ResultSink, ?*anyopaque) callconv(.c) void,
+    userdata: ?*anyopaque,
+    affinity: tool.ThreadAffinity,
+    state: *State,
+    handle: tool.ToolHandle = .{},
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    fn retain(self: *CTool) void {
+        _ = self.refs.fetchAdd(1, .acq_rel);
+    }
+    fn release(self: *CTool) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) Allocator.destroy(self);
+    }
+};
 const Sink = struct { sink: ResultSink, result: ?tool.CallbackResult = null, operation: ?nar.OperationId = null };
 fn sinkComplete(raw: *ResultSink, value: Slice) callconv(.c) u32 {
     const sink: *Sink = @fieldParentPtr("sink", raw);
@@ -268,7 +370,43 @@ fn sinkFail(raw: *ResultSink, value: u32) callconv(.c) u32 {
 }
 fn cTool(raw: ?*anyopaque, invocation: tool.InvocationContext) !tool.CallbackResult {
     const value: *CTool = @ptrCast(@alignCast(raw.?));
+    if (value.affinity != .any) {
+        const args = try std.json.Stringify.valueAlloc(Allocator, invocation.arguments.*, .{});
+        const work = Allocator.create(CPumpWork) catch {
+            Allocator.free(args);
+            return error.OutOfMemory;
+        };
+        value.retain();
+        work.* = .{ .tool = value, .arguments = args, .world_revision = invocation.world_revision, .target = invocation.target };
+        const id = try value.state.operations().submitOwned(.{ .affinity = if (value.affinity == .main) .pump else .compute }, runCPumpTool, work, deinitCPumpWork);
+        return .{ .pending = id };
+    }
     return invokeTool(value, invocation, null);
+}
+const CPumpWork = struct {
+    tool: *CTool,
+    arguments: []u8,
+    world_revision: nar.WorldRevision,
+    target: ?nar.ObjectRef,
+};
+fn runCPumpTool(op_context: *operation.Context) void {
+    const work: *CPumpWork = @ptrCast(@alignCast(op_context.userData().?));
+    var sink = Sink{ .sink = .{ .complete = sinkComplete, .fail = sinkFail, .userdata = work.tool.state }, .operation = op_context.operationId() };
+    const call = Invocation{
+        .arguments_json = .{ .data = work.arguments.ptr, .size = work.arguments.len },
+        .world_revision = work.world_revision.toInt(),
+        .object_id = if (work.target) |target| target.id else 0,
+        .object_generation = if (work.target) |target| target.generation else 0,
+        .reserved = 0,
+        .operation = op_context.operationId().toInt(),
+    };
+    work.tool.callback(&call, &sink.sink, work.tool.userdata);
+}
+fn deinitCPumpWork(_: std.mem.Allocator, raw: ?*anyopaque) void {
+    const work: *CPumpWork = @ptrCast(@alignCast(raw.?));
+    work.tool.release();
+    Allocator.free(work.arguments);
+    Allocator.destroy(work);
 }
 fn invokeTool(value: *CTool, invocation: tool.InvocationContext, op: ?nar.OperationId) !tool.CallbackResult {
     const args = try std.json.Stringify.valueAlloc(Allocator, invocation.arguments.*, .{});

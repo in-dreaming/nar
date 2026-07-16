@@ -288,12 +288,20 @@ pub const ReplaySession = struct {
     fn nextModel(self: *ReplaySession, expected: EventType) ReplayError!Record {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const record = try self.reader.next() orelse return error.ReplayExhausted;
-        if (record.kind != expected) {
-            self.divergence = .{ .sequence = record.sequence, .path = "kind", .expected = @tagName(record.kind), .actual = @tagName(expected) };
-            return error.Diverged;
+        while (try self.reader.next()) |record| {
+            if (record.kind == expected) return record;
+            // These records occur between model pulls. They are validated by
+            // their owning replay surface; this backend advances to the next
+            // recorded request/event boundary.
+            switch (record.kind) {
+                .turn_start, .context_manifest, .tool_validation, .tool_call, .tool_result, .operation_transition, .budget => continue,
+                else => {
+                    self.divergence = .{ .sequence = record.sequence, .path = "kind", .expected = @tagName(record.kind), .actual = @tagName(expected) };
+                    return error.Diverged;
+                },
+            }
         }
-        return record;
+        return error.ReplayExhausted;
     }
 };
 

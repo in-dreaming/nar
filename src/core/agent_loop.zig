@@ -444,7 +444,16 @@ pub const Agent = struct {
         var event = if (state == .completed) domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .priority = .high, .payload = .{ .final_response = foundation.memory.SharedBuffer.initCopy(self.runtime.allocator, turn.output.items, .general) catch return } } else domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .priority = .high, .payload = if (state == .cancelled) .{ .cancelled = reason orelse .requested } else .{ .failed = code } };
         self.mailbox.post(event) catch event.deinit();
         if (state == .completed) _ = self.session.append(.turn_outcome, .assistant, turn.output.items) catch {};
-        self.writeTrace(.terminal, if (state == .completed) "{\"reason\":\"completed\"}" else "{\"reason\":\"failed\"}");
+        self.writeTrace(.terminal, switch (state) {
+            .completed => "{\"reason\":\"completed\"}",
+            .cancelled => switch (reason orelse .requested) {
+                .requested => "{\"reason\":\"cancelled_requested\"}",
+                .timeout => "{\"reason\":\"cancelled_timeout\"}",
+                .shutdown => "{\"reason\":\"cancelled_shutdown\"}",
+                .owner_destroyed => "{\"reason\":\"cancelled_owner_destroyed\"}",
+            },
+            else => "{\"reason\":\"failed\"}",
+        });
     }
     fn writeTrace(self: *Agent, kind: trace.EventType, payload: []const u8) void {
         if (self.trace_writer) |writer| writer.appendCanonical(kind, payload) catch {};

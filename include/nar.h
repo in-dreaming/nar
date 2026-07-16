@@ -79,7 +79,12 @@ typedef struct nar_event { uint32_t struct_size, api_version; nar_event_kind kin
 
 uint32_t nar_api_version(void);
 nar_error_code nar_runtime_create(const nar_runtime_config *, nar_runtime_handle *);
+/* Validates and copies a complete trace. The replay model route is
+ * provider_id="replay", model_id="replay" and never falls back to HTTP. */
 nar_error_code nar_replay_runtime_create(const nar_runtime_config *, nar_slice trace, nar_runtime_handle *);
+/* A zero deadline waits for convergence. A finite absolute monotonic deadline
+ * returns NAR_TIMEOUT when staged shutdown has not converged; destroy remains
+ * required and performs final convergence. */
 nar_error_code nar_runtime_shutdown(nar_runtime_handle, uint64_t deadline_monotonic_ns);
 void nar_runtime_destroy(nar_runtime_handle);
 nar_error_code nar_tool_register(nar_runtime_handle, const nar_tool_descriptor *, nar_tool_callback, void *, nar_tool_handle *);

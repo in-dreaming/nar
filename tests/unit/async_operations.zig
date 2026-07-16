@@ -65,6 +65,42 @@ test "operation registry rejects bounded capacity and reuses slots generationall
     try std.testing.expectEqual(nar.core.ExecutionServices.Operations.Result.stale, registry.poll(first, 0));
 }
 
+test "owned operation callback data is released once on completion and cancellation" {
+    var host = try nar.spindle.TestHost.init(std.testing.allocator, 2);
+    var completed_cleanups: usize = 0;
+    const completed_data = try std.testing.allocator.create(OwnedData);
+    completed_data.* = .{ .cleanups = &completed_cleanups };
+    const completed = try host.operations().submitOwned(.{ .affinity = .pump }, completeOwned, completed_data, deinitOwned);
+    try std.testing.expectEqual(@as(usize, 1), host.pump(1, std.time.ns_per_s));
+    try expectPayload(host.operations().poll(completed, 0));
+    host.operations().release(completed);
+    _ = host.operations().stateOf(completed);
+    try std.testing.expectEqual(@as(usize, 1), completed_cleanups);
+
+    var cancelled_cleanups: usize = 0;
+    const cancelled_data = try std.testing.allocator.create(OwnedData);
+    cancelled_data.* = .{ .cleanups = &cancelled_cleanups };
+    const cancelled = try host.operations().submitOwned(.{ .affinity = .pump }, completeOwned, cancelled_data, deinitOwned);
+    host.operations().cancel(cancelled, .owner_destroyed);
+    host.operations().release(cancelled);
+    _ = host.pump(1, std.time.ns_per_s);
+    _ = host.operations().stateOf(cancelled);
+    host.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cancelled_cleanups);
+}
+
+const OwnedData = struct { cleanups: *usize };
+fn completeOwned(context: *nar.operation.Context) void {
+    const data: *OwnedData = @ptrCast(@alignCast(context.userData().?));
+    _ = data;
+    complete(context);
+}
+fn deinitOwned(allocator: std.mem.Allocator, raw: ?*anyopaque) void {
+    const data: *OwnedData = @ptrCast(@alignCast(raw.?));
+    data.cleanups.* += 1;
+    allocator.destroy(data);
+}
+
 test "production operation submissions are safe from concurrent callers" {
     var host = try nar.spindle.Host.init(std.testing.allocator, .{ .compute_workers = 2, .queue_capacity = 32 });
     defer host.deinit();
