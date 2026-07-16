@@ -149,9 +149,34 @@ pub const TurnId = Id(struct {
 pub const ToolId = Id(struct {
     const name = "ToolId";
 });
-pub const OperationId = Id(struct {
-    const name = "OperationId";
-});
+/// A generation-checked operation identity. The low 32 bits name a registry
+/// slot and the high 32 bits are advanced whenever that slot is reused.
+pub const OperationId = struct {
+    value: u64 = 0,
+
+    pub fn init(value: u64) ?OperationId {
+        return if (value == 0) null else .{ .value = value };
+    }
+    /// Compatibility constructor for externally supplied, non-registry IDs.
+    pub fn fromInt(value: u64) OperationId {
+        return if (value > 0 and value <= std.math.maxInt(u32)) fromParts(@intCast(value), 1) else .{ .value = value };
+    }
+    pub fn fromParts(slot_value: u32, generation_value: u32) OperationId {
+        return .{ .value = (@as(u64, generation_value) << 32) | slot_value };
+    }
+    pub fn slot(self: OperationId) u32 {
+        return @truncate(self.value);
+    }
+    pub fn generation(self: OperationId) u32 {
+        return @truncate(self.value >> 32);
+    }
+    pub fn toInt(self: OperationId) u64 {
+        return self.value;
+    }
+    pub fn isValid(self: OperationId) bool {
+        return self.slot() != 0 and self.generation() != 0;
+    }
+};
 pub const WorldRevision = Id(struct {
     const name = "WorldRevision";
 });

@@ -2,6 +2,7 @@
 const std = @import("std");
 const spindle = @import("spindle");
 const core = @import("../../core/agent_loop.zig");
+const operation = @import("../../runtime/operation.zig");
 
 pub const Config = struct {
     compute_workers: usize = 1,
@@ -20,6 +21,7 @@ pub const Host = struct {
         allocator: std.mem.Allocator,
         threaded: std.Io.Threaded,
         spindle_runtime: spindle.runtime.Runtime,
+        operations: operation.Registry,
         nar_runtime: core.Runtime,
     };
 
@@ -38,7 +40,9 @@ pub const Host = struct {
             .fault = config.fault,
         });
         errdefer state.spindle_runtime.deinit();
-        state.nar_runtime = try core.Runtime.init(allocator, .{ .services = servicesFor(&state.spindle_runtime, state.threaded.io()) });
+        state.operations = try operation.Registry.init(allocator, .{}, state.spindle_runtime.computeExecutor(), state.spindle_runtime.blockingExecutor(), state.spindle_runtime.pumpExecutor());
+        errdefer state.operations.deinit();
+        state.nar_runtime = try core.Runtime.init(allocator, .{ .services = servicesFor(&state.spindle_runtime, state.threaded.io(), state.operations.services()) });
         return .{ .state = state };
     }
 
@@ -51,18 +55,23 @@ pub const Host = struct {
     pub fn spindleRuntime(self: *Host) *spindle.runtime.Runtime {
         return &self.state.spindle_runtime;
     }
+    pub fn operations(self: *Host) *operation.Registry {
+        return &self.state.operations;
+    }
 
     /// Cancels NAR turns before requesting Spindle's staged shutdown.
     pub fn shutdown(self: *Host, deadline_monotonic_ns: ?u64) spindle.runtime.ShutdownReport {
         self.state.nar_runtime.shutdown();
+        self.state.operations.shutdown();
         return self.state.spindle_runtime.shutdown(deadline_monotonic_ns);
     }
 
     pub fn deinit(self: *Host) void {
-        _ = self.shutdown(null);
         const state = self.state;
+        _ = self.shutdown(null);
         state.nar_runtime.deinit();
         state.spindle_runtime.deinit();
+        state.operations.deinit();
         state.threaded.deinit();
         state.allocator.destroy(state);
         self.* = undefined;
@@ -82,6 +91,7 @@ pub const TestHost = struct {
         pump_executor: spindle.executor.PumpExecutor,
         event_storage: [32]spindle.observability.event.Event = undefined,
         event_ring: spindle.observability.event.RingSink,
+        operations: operation.Registry,
         nar_runtime: core.Runtime,
     };
 
@@ -92,9 +102,12 @@ pub const TestHost = struct {
         state.clock_source = spindle.core.clock.VirtualClock.init(0, 0);
         state.compute = spindle.executor.DeterministicExecutor.init(allocator);
         errdefer state.compute.deinit();
+        state.blocking = .{};
         state.pump_executor = try spindle.executor.PumpExecutor.init(allocator, queue_capacity);
         errdefer state.pump_executor.deinit();
         state.event_ring = spindle.observability.event.RingSink.init(&state.event_storage);
+        state.operations = try operation.Registry.init(allocator, .{}, state.compute.executor(), state.blocking.executor(), state.pump_executor.executor());
+        errdefer state.operations.deinit();
         state.nar_runtime = try core.Runtime.init(allocator, .{ .services = servicesForState(state) });
         return .{ .state = state };
     }
@@ -111,14 +124,22 @@ pub const TestHost = struct {
     pub fn submitPump(self: *TestHost, task: *spindle.executor.Task) spindle.executor.SubmitError!void {
         try self.state.pump_executor.submit(task, .{});
     }
+    pub fn operations(self: *TestHost) *operation.Registry {
+        return &self.state.operations;
+    }
+    pub fn runCompute(self: *TestHost) !void {
+        try self.state.compute.run();
+    }
     pub fn services(self: *TestHost) core.ExecutionServices {
         return servicesForState(self.state);
     }
     pub fn deinit(self: *TestHost) void {
         const state = self.state;
         state.nar_runtime.deinit();
+        state.operations.shutdown();
         state.pump_executor.deinit();
         state.compute.deinit();
+        state.operations.deinit();
         state.allocator.destroy(state);
         self.* = undefined;
     }
@@ -131,10 +152,11 @@ fn servicesForState(state: *TestHost.State) core.ExecutionServices {
         .blocking = .{ .context = &state.blocking, .worker_count_fn = inlineWorkers },
         .pump = .{ .context = &state.pump_executor, .drain_fn = drainPump },
         .events = .{ .context = &state.event_ring, .emit_fn = emitEvent },
+        .operations = state.operations.services(),
     };
 }
 
-fn servicesFor(runtime: *spindle.runtime.Runtime, io: std.Io) core.ExecutionServices {
+fn servicesFor(runtime: *spindle.runtime.Runtime, io: std.Io, operations: core.ExecutionServices.Operations) core.ExecutionServices {
     return .{
         .clock = .{ .context = runtime, .now_fn = runtimeNow },
         .compute = .{ .context = runtime, .worker_count_fn = computeWorkers },
@@ -142,6 +164,7 @@ fn servicesFor(runtime: *spindle.runtime.Runtime, io: std.Io) core.ExecutionServ
         .pump = .{ .context = runtime, .drain_fn = drainRuntimePump },
         .events = .{ .context = runtime, .emit_fn = emitRuntimeEvent },
         .io = io,
+        .operations = operations,
     };
 }
 fn runtimeNow(raw: ?*anyopaque) u64 {

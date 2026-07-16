@@ -41,11 +41,37 @@ pub const ExecutionServices = struct {
             self.emit_fn(self.context, kind, value);
         }
     };
+    /// Host-owned asynchronous operation registry. Completed buffers transfer
+    /// to the caller of `poll`; all other results own no caller resources.
+    pub const Operations = struct {
+        pub const Result = union(enum) {
+            pending,
+            completed: foundation.memory.SharedBuffer,
+            failed: domain.ErrorCode,
+            cancelled: domain.CancelReason,
+            timed_out,
+            stale,
+        };
+        context: ?*anyopaque = null,
+        poll_fn: *const fn (?*anyopaque, domain.OperationId, u64) Result = noOperation,
+        cancel_fn: *const fn (?*anyopaque, domain.OperationId, domain.CancelReason) void = noOperationCancel,
+        release_fn: *const fn (?*anyopaque, domain.OperationId) void = noOperationRelease,
+        pub fn poll(self: Operations, id: domain.OperationId, now: u64) Result {
+            return self.poll_fn(self.context, id, now);
+        }
+        pub fn cancel(self: Operations, id: domain.OperationId, reason: domain.CancelReason) void {
+            self.cancel_fn(self.context, id, reason);
+        }
+        pub fn release(self: Operations, id: domain.OperationId) void {
+            self.release_fn(self.context, id);
+        }
+    };
     clock: Clock = .{},
     compute: Executor = .{},
     blocking: Executor = .{},
     pump: Pump = .{},
     events: Events = .{},
+    operations: Operations = .{},
     io: ?std.Io = null,
 };
 pub const RuntimeConfig = struct { max_agents: usize = 16, mailbox_capacity: usize = 64, services: ExecutionServices = .{} };
@@ -89,6 +115,10 @@ pub const Runtime = struct {
         if (self.stopped) return;
         self.stopped = true;
         for (self.agents.items) |agent| agent.cancel(.shutdown);
+    }
+    /// Executes caller-thread work submitted to the host pump executor.
+    pub fn pumpMainThread(self: *Runtime, max_jobs: usize, max_nanos: u64) usize {
+        return self.config.services.pump.drain(max_jobs, max_nanos);
     }
     pub fn destroyAgent(self: *Runtime, agent: *Agent) bool {
         for (self.agents.items, 0..) |value, i| if (value == agent) {
@@ -137,6 +167,7 @@ pub const Agent = struct {
     pub fn cancel(self: *Agent, reason: domain.CancelReason) void {
         if (self.state == .idle or terminal(self.state)) return;
         if (self.turn) |*turn| if (turn.request) |request| request.backend.cancel(request.handle) catch {};
+        if (self.turn) |turn| if (turn.operation) |operation| self.runtime.config.services.operations.cancel(operation, reason);
         self.finish(.cancelled, .cancelled, reason);
     }
     /// Performs at most one context/model/tool action or one model event.
@@ -151,6 +182,7 @@ pub const Agent = struct {
             .building_context => self.startModel(turn),
             .waiting_model => self.modelEvent(turn),
             .waiting_tool => self.toolCall(turn),
+            .waiting_operation => self.operationEvent(turn),
             else => .terminal,
         };
     }
@@ -317,9 +349,51 @@ pub const Agent = struct {
                 self.writeTrace(.tool_result, "{}");
                 return .progressed;
             },
-            .pending => return self.toolFailure(turn, .operation_failed),
+            .pending => |operation| {
+                turn.operation = operation;
+                self.state = .waiting_operation;
+                self.writeTrace(.operation_transition, "{\"state\":\"queued\"}");
+                return .progressed;
+            },
             .failure => |code| return self.toolFailure(turn, code),
         }
+    }
+    fn operationEvent(self: *Agent, turn: *Turn) TickResult {
+        const operation = turn.operation orelse {
+            self.finish(.failed, .internal_error, null);
+            return .terminal;
+        };
+        var result = self.runtime.config.services.operations.poll(operation, self.runtime.config.services.clock.now());
+        switch (result) {
+            .pending => return .would_block,
+            .completed => |*buffer| {
+                defer buffer.release();
+                const bytes = buffer.bytes() catch return self.toolFailure(turn, .internal_error);
+                turn.tool_result = self.runtime.allocator.dupe(u8, bytes) catch {
+                    self.finish(.failed, .budget_exceeded, null);
+                    return .terminal;
+                };
+                self.runtime.config.services.operations.release(operation);
+                turn.operation = null;
+                self.session.append(.tool_result, .tool, turn.tool_result.?) catch {
+                    self.finish(.failed, .budget_exceeded, null);
+                    return .terminal;
+                };
+                self.state = .building_context;
+                self.writeTrace(.operation_transition, "{\"state\":\"completed\"}");
+                return .progressed;
+            },
+            .failed => |code| return self.operationFailure(turn, operation, code),
+            .cancelled => return self.operationFailure(turn, operation, .cancelled),
+            .timed_out => return self.operationFailure(turn, operation, .timeout),
+            .stale => return self.operationFailure(turn, operation, .operation_failed),
+        }
+    }
+    fn operationFailure(self: *Agent, turn: *Turn, operation: domain.OperationId, code: domain.ErrorCode) TickResult {
+        self.runtime.config.services.operations.release(operation);
+        turn.operation = null;
+        self.writeTrace(.operation_transition, "{\"state\":\"failed\"}");
+        return self.toolFailure(turn, code);
     }
     fn toolFailure(self: *Agent, turn: *Turn, code: domain.ErrorCode) TickResult {
         if (self.config.tool_error_policy == .fail_turn) {
@@ -354,6 +428,11 @@ pub const Agent = struct {
         const turn = &(self.turn orelse return);
         if (turn.request) |request| request.backend.release(request.handle);
         turn.request = null;
+        if (turn.operation) |operation| {
+            self.runtime.config.services.operations.cancel(operation, reason orelse .requested);
+            self.runtime.config.services.operations.release(operation);
+            turn.operation = null;
+        }
         self.state = state;
         var event = if (state == .completed) domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .priority = .high, .payload = .{ .final_response = foundation.memory.SharedBuffer.initCopy(self.runtime.allocator, turn.output.items, .general) catch return } } else domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .priority = .high, .payload = if (state == .cancelled) .{ .cancelled = reason orelse .requested } else .{ .failed = code } };
         self.mailbox.post(event) catch event.deinit();
@@ -387,6 +466,7 @@ const Turn = struct {
     request: ?Request = null,
     call: ?ToolCall = null,
     tool_result: ?[]u8 = null,
+    operation: ?domain.OperationId = null,
     output: std.ArrayListUnmanaged(u8) = .empty,
     loop_keys: std.StringHashMapUnmanaged(usize) = .empty,
     fn init(allocator: std.mem.Allocator, id: domain.TurnId, submit: SubmitRequest, time: u64, limits: context.TurnBudgetLimits) !Turn {
@@ -394,6 +474,7 @@ const Turn = struct {
     }
     fn deinit(self: *Turn, allocator: std.mem.Allocator) void {
         if (self.request) |request| request.backend.release(request.handle);
+        if (self.operation) |_| {}
         if (self.call) |*call| call.deinit(allocator);
         allocator.free(self.input);
         self.world.deinit();
@@ -418,3 +499,8 @@ fn noDrain(_: ?*anyopaque, _: usize, _: u64) usize {
     return 0;
 }
 fn noEvent(_: ?*anyopaque, _: []const u8, _: i64) void {}
+fn noOperation(_: ?*anyopaque, _: domain.OperationId, _: u64) ExecutionServices.Operations.Result {
+    return .stale;
+}
+fn noOperationCancel(_: ?*anyopaque, _: domain.OperationId, _: domain.CancelReason) void {}
+fn noOperationRelease(_: ?*anyopaque, _: domain.OperationId) void {}
