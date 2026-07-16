@@ -11,9 +11,6 @@ $ErrorActionPreference = "Stop"
 $TaskDirectory = $PSScriptRoot
 $SetupDocument = Join-Path $TaskDirectory "setup.md"
 $TaskDocuments = @(
-    "07-spindle-runtime-migration.md",
-    "08-async-operations.md",
-    "09-openai-compatible.md",
     "10-replay-diff.md",
     "11-c-abi.md",
     "12-runtime-acceptance.md"
@@ -80,7 +77,7 @@ $taskText
 Required procedure:
 1. Read AGENTS.md if present, then inspect relevant existing code, tests, dependency public APIs, and both documents above.
 2. Implement only $taskId. Do not start later tasks or unrelated refactors.
-3. Preserve unrelated changes. Never edit files inside deps/fund or deps/spindle.
+3. Preserve unrelated changes. If a required dependency defect is inside deps/fund or deps/spindle, fix it directly, validate it, and commit the submodule before committing the parent gitlink. Do not make unrelated dependency changes.
 4. Add real tests for normal, error, cancellation, resource exhaustion, ownership, and concurrency paths required by the task.
 5. Run every acceptance command in the task and fix failures caused by this work.
 6. Review git diff and public exports. Do not leave TODO, FIXME, placeholders, empty implementations, or fixed-success stubs.
@@ -192,7 +189,9 @@ $status
         if ($attempt -lt $MaxAttempts) { Write-Warning "Task incomplete; retrying in the same Codex session when available." }
     }
 
-    if (-not $success) { throw "Task $taskId failed after $MaxAttempts attempts. See $failurePath" }
+    if (-not $success) {
+        throw "Task $taskId failed after $MaxAttempts attempts. The runner stopped before later tasks. Resolve this task outside the runner, then rerun. See $failurePath"
+    }
 }
 
 Write-Host ""
