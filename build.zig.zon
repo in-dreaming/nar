@@ -9,7 +9,6 @@
         },
         .spindle = .{
             .path = "deps/spindle",
-            .lazy = true,
         },
     },
     .paths = .{

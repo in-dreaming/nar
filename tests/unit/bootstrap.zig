@@ -8,6 +8,7 @@ comptime {
     _ = @import("context_session_budget.zig");
     _ = @import("trace_format.zig");
     _ = @import("agent_loop.zig");
+    _ = @import("spindle_runtime.zig");
 }
 
 test "public build configuration is internally consistent" {

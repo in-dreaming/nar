@@ -39,6 +39,10 @@ pub const trace = @import("trace/runtime.zig");
 /// Bounded deterministic runtime, agent, and turn state machine.
 pub const core = @import("core/agent_loop.zig");
 
+/// Spindle-backed production and deterministic test hosts. A host owns its
+/// Spindle runtime while `core.Runtime` only borrows the exposed services.
+pub const spindle = @import("adapters/spindle/host.zig");
+
 /// Build-time configuration selected by the package consumer.
 /// Reading this value is thread-safe and has no ownership or lifetime concerns.
 pub const build_options = @import("nar_build_options");

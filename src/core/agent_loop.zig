@@ -10,7 +10,45 @@ const trace = @import("../trace/runtime.zig");
 pub const TurnState = enum { idle, building_context, waiting_model, waiting_tool, waiting_operation, completed, failed, cancelled };
 pub const ToolErrorPolicy = enum { return_to_model, fail_turn };
 pub const TickResult = enum { progressed, would_block, terminal };
-pub const RuntimeConfig = struct { max_agents: usize = 16, mailbox_capacity: usize = 64, now_ns: *const fn () u64 = now };
+/// Borrowed execution and time services. Their owner must outlive `Runtime`.
+/// Core intentionally uses opaque facades so it does not depend on a host adapter.
+pub const ExecutionServices = struct {
+    pub const Clock = struct {
+        context: ?*anyopaque = null,
+        now_fn: *const fn (?*anyopaque) u64 = systemNow,
+        pub fn now(self: Clock) u64 {
+            return self.now_fn(self.context);
+        }
+    };
+    pub const Executor = struct {
+        context: ?*anyopaque = null,
+        worker_count_fn: *const fn (?*anyopaque) usize = noWorkers,
+        pub fn workerCount(self: Executor) usize {
+            return self.worker_count_fn(self.context);
+        }
+    };
+    pub const Pump = struct {
+        context: ?*anyopaque = null,
+        drain_fn: *const fn (?*anyopaque, usize, u64) usize = noDrain,
+        pub fn drain(self: Pump, max_jobs: usize, max_ns: u64) usize {
+            return self.drain_fn(self.context, max_jobs, max_ns);
+        }
+    };
+    pub const Events = struct {
+        context: ?*anyopaque = null,
+        emit_fn: *const fn (?*anyopaque, []const u8, i64) void = noEvent,
+        pub fn emit(self: Events, kind: []const u8, value: i64) void {
+            self.emit_fn(self.context, kind, value);
+        }
+    };
+    clock: Clock = .{},
+    compute: Executor = .{},
+    blocking: Executor = .{},
+    pump: Pump = .{},
+    events: Events = .{},
+    io: ?std.Io = null,
+};
+pub const RuntimeConfig = struct { max_agents: usize = 16, mailbox_capacity: usize = 64, services: ExecutionServices = .{} };
 pub const AgentConfig = struct { provider_id: []const u8, definition: context.AgentDefinition, tool_error_policy: ToolErrorPolicy = .return_to_model, max_repeated_tool_calls: usize = 2 };
 pub const SubmitRequest = struct { input: []const u8, world: *const context.WorldSnapshot };
 
@@ -21,11 +59,13 @@ pub const Runtime = struct {
     models: model.Registry,
     tools: tool.Registry,
     agents: std.ArrayListUnmanaged(*Agent) = .empty,
+    stopped: bool = false,
     pub fn init(allocator: std.mem.Allocator, config: RuntimeConfig) !Runtime {
         if (config.max_agents == 0 or config.mailbox_capacity == 0) return error.InvalidArgument;
         return .{ .allocator = allocator, .config = config, .models = model.Registry.init(allocator), .tools = tool.Registry.init(allocator) };
     }
     pub fn deinit(self: *Runtime) void {
+        self.shutdown();
         for (self.agents.items) |agent| {
             agent.deinit();
             self.allocator.destroy(agent);
@@ -35,6 +75,7 @@ pub const Runtime = struct {
         self.models.deinit();
     }
     pub fn createAgent(self: *Runtime, config: AgentConfig) !*Agent {
+        if (self.stopped) return error.InvalidState;
         if (self.agents.items.len == self.config.max_agents) return error.BudgetExceeded;
         const agent = try self.allocator.create(Agent);
         errdefer self.allocator.destroy(agent);
@@ -42,6 +83,12 @@ pub const Runtime = struct {
         errdefer agent.deinit();
         try self.agents.append(self.allocator, agent);
         return agent;
+    }
+    /// Cancels all active turns. It does not deinitialize borrowed services.
+    pub fn shutdown(self: *Runtime) void {
+        if (self.stopped) return;
+        self.stopped = true;
+        for (self.agents.items) |agent| agent.cancel(.shutdown);
     }
     pub fn destroyAgent(self: *Runtime, agent: *Agent) bool {
         for (self.agents.items, 0..) |value, i| if (value == agent) {
@@ -79,7 +126,7 @@ pub const Agent = struct {
         if (self.turn) |*old| old.deinit(self.runtime.allocator);
         const id = domain.TurnId.init(self.next_turn) orelse return error.BudgetExceeded;
         self.next_turn = std.math.add(u64, self.next_turn, 1) catch return error.BudgetExceeded;
-        self.turn = try Turn.init(self.runtime.allocator, id, request, self.runtime.config.now_ns(), self.config.definition.default_budget);
+        self.turn = try Turn.init(self.runtime.allocator, id, request, self.runtime.config.services.clock.now(), self.config.definition.default_budget);
         try self.session.append(.message, .user, request.input);
         self.state = .building_context;
         return id;
@@ -96,7 +143,7 @@ pub const Agent = struct {
     pub fn tick(self: *Agent) TickResult {
         if (self.state == .idle or terminal(self.state)) return .terminal;
         const turn = &(self.turn orelse return .terminal);
-        turn.budget.check(self.runtime.config.now_ns(), null) catch |err| {
+        turn.budget.check(self.runtime.config.services.clock.now(), null) catch |err| {
             self.finishError(err);
             return .terminal;
         };
@@ -287,7 +334,7 @@ pub const Agent = struct {
         return .progressed;
     }
     fn postText(self: *Agent, id: domain.TurnId, buffer: foundation.memory.SharedBuffer) !void {
-        var event = domain.AgentEvent{ .turn_id = id, .timestamp = .{ .nanoseconds = self.runtime.config.now_ns() }, .payload = .{ .text_delta = try buffer.clone() } };
+        var event = domain.AgentEvent{ .turn_id = id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .payload = .{ .text_delta = try buffer.clone() } };
         self.mailbox.post(event) catch |err| {
             event.deinit();
             return err;
@@ -308,7 +355,7 @@ pub const Agent = struct {
         if (turn.request) |request| request.backend.release(request.handle);
         turn.request = null;
         self.state = state;
-        var event = if (state == .completed) domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.now_ns() }, .priority = .high, .payload = .{ .final_response = foundation.memory.SharedBuffer.initCopy(self.runtime.allocator, turn.output.items, .general) catch return } } else domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.now_ns() }, .priority = .high, .payload = if (state == .cancelled) .{ .cancelled = reason orelse .requested } else .{ .failed = code } };
+        var event = if (state == .completed) domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .priority = .high, .payload = .{ .final_response = foundation.memory.SharedBuffer.initCopy(self.runtime.allocator, turn.output.items, .general) catch return } } else domain.AgentEvent{ .turn_id = turn.id, .timestamp = .{ .nanoseconds = self.runtime.config.services.clock.now() }, .priority = .high, .payload = if (state == .cancelled) .{ .cancelled = reason orelse .requested } else .{ .failed = code } };
         self.mailbox.post(event) catch event.deinit();
         if (state == .completed) _ = self.session.append(.turn_outcome, .assistant, turn.output.items) catch {};
         self.writeTrace(.terminal, if (state == .completed) "{\"reason\":\"completed\"}" else "{\"reason\":\"failed\"}");
@@ -360,7 +407,14 @@ const Turn = struct {
 fn terminal(state: TurnState) bool {
     return state == .completed or state == .failed or state == .cancelled;
 }
-fn now() u64 {
+fn systemNow(_: ?*anyopaque) u64 {
     var clock = foundation.time.SystemClock{};
     return @intCast(@max(0, clock.clock().monotonicNow().nanoseconds));
 }
+fn noWorkers(_: ?*anyopaque) usize {
+    return 0;
+}
+fn noDrain(_: ?*anyopaque, _: usize, _: u64) usize {
+    return 0;
+}
+fn noEvent(_: ?*anyopaque, _: []const u8, _: i64) void {}

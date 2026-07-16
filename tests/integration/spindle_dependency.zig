@@ -1,5 +1,13 @@
+const std = @import("std");
 const spindle = @import("spindle");
+const nar = @import("nar");
 
-test "optional spindle dependency has a public module root" {
-    _ = spindle.executor;
+test "NAR profile and spindle features agree" {
+    try std.testing.expectEqual(nar.hasRuntimeSupport(), spindle.runtime.Features.task_graph);
+    try std.testing.expectEqual(nar.hasRuntimeSupport(), spindle.runtime.Features.resource_graph);
+    try std.testing.expect(!spindle.runtime.Features.ecs);
+    try std.testing.expect(!spindle.runtime.Features.workflow);
+    try std.testing.expect(!spindle.runtime.Features.workflow_sqlite);
+    try std.testing.expect(!spindle.runtime.Features.workflow_archive);
+    try std.testing.expect(!spindle.runtime.Features.workflow_archive_http);
 }

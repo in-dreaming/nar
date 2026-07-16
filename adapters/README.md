@@ -1,5 +1,6 @@
 # Adapters
 
-This directory is reserved for optional runtime integration adapters. Bootstrap
-does not publish an adapter implementation; the optional spindle compile check
-lives in `tests/integration` so NAR core remains independent of spindle.
+`src/adapters/spindle/host.zig` owns the production `std.Io.Threaded` and
+aggregate Spindle runtime. NAR core borrows its execution services and never
+deinitializes them. The same adapter provides `TestHost` for virtual-clock,
+caller-driven tests.

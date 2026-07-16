@@ -25,9 +25,13 @@ zig build check -Dprofile=runtime -Dspindle=true
 zig build test-all
 ```
 
-`-Dspindle=true` requires `-Dprofile=runtime`; it resolves the local spindle
-submodule only for its compile-time integration check. NAR core does not import
-spindle.
+Both profiles use Spindle's executor/runtime primitives. `minimal` disables
+task graph, resource graph, ECS, workflow, SQLite, and archive features;
+`runtime` enables only task and resource graphs. `nar.spindle.Host` owns a
+threaded Spindle runtime and exposes borrowed services to `core.Runtime`.
+Call `Host.shutdown(deadline)` before `Host.deinit()` to cancel active turns
+and perform Spindle's staged shutdown. `nar.spindle.TestHost` provides a
+virtual-clock, caller-pumped deterministic host for tests.
 
 ## Current scope
 
