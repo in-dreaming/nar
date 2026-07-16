@@ -15,7 +15,12 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "runtime", profile == .runtime);
     options.addOption(bool, "spindle", true);
 
-    const foundation = b.dependency("foundation", .{}).module("foundation");
+    const foundation_dependency = b.dependency("foundation", .{
+        .profile = if (profile == .runtime) "agent" else "core",
+        .http = profile == .runtime,
+        .testing = true,
+    });
+    const foundation = foundation_dependency.module("foundation");
     const spindle = b.dependency("spindle", .{
         .@"task-graph" = profile == .runtime,
         .@"resource-graph" = profile == .runtime,
@@ -89,6 +94,23 @@ pub fn build(b: *std.Build) void {
     integration_tests.root_module.addImport("nar", nar);
     const integration = b.step("test-integration", "Run external Zig consumer integration tests");
     integration.dependOn(&b.addRunArtifact(integration_tests).step);
+    if (profile == .runtime and target.result.os.tag == .windows) {
+        const openai_http_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/integration/openai_http.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        openai_http_tests.root_module.addImport("nar", nar);
+        openai_http_tests.root_module.addImport("foundation", foundation);
+        openai_http_tests.root_module.addImport("curl_adapter", foundation_dependency.module("curl_adapter"));
+        const fixture_options = b.addOptions();
+        fixture_options.addOptionPath("server_script", b.path("tests/fixtures/openai_server.ps1"));
+        fixture_options.addOptionPath("curl_library", foundation_dependency.path("third_party/curl/windows-x64/bin/libcurl-x64.dll"));
+        openai_http_tests.root_module.addOptions("build_options", fixture_options);
+        integration.dependOn(&b.addRunArtifact(openai_http_tests).step);
+    }
 
     const cabi_bootstrap_tests = b.addTest(.{
         .root_module = b.createModule(.{

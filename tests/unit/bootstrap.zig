@@ -10,6 +10,7 @@ comptime {
     _ = @import("agent_loop.zig");
     _ = @import("spindle_runtime.zig");
     _ = @import("async_operations.zig");
+    if (nar.hasRuntimeSupport()) _ = @import("openai_compatible.zig");
 }
 
 test "public build configuration is internally consistent" {

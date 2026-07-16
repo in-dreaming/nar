@@ -46,6 +46,10 @@ pub const spindle = @import("adapters/spindle/host.zig");
 /// Host-owned asynchronous operation registry and executor affinity contracts.
 pub const operation = @import("runtime/operation.zig");
 
+/// OpenAI-compatible HTTP/SSE model backend. This surface is absent from
+/// minimal builds so they neither compile HTTP code nor require an HTTP host.
+pub const openai = if (build_options.runtime) @import("model/openai.zig") else struct {};
+
 /// Build-time configuration selected by the package consumer.
 /// Reading this value is thread-safe and has no ownership or lifetime concerns.
 pub const build_options = @import("nar_build_options");
